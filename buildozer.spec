@@ -14,17 +14,18 @@ source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VE
 # 版本(与 VERSION.txt 保持一致)
 version = 1.00
 
-# 依赖: python3 + pygame-ce
-# 锁到 3.12: pygame-ce 2.5.x 对 3.12 支持最稳, Python 3.14 在 p4a 上有打开即退的先例
-requirements = python3==3.12.10,hostpython3==3.12.10,pygame-ce
+# 依赖: python3 + pygame
+# 注意: p4a 内置的是老版 pygame 2.1.0, 它的 C 代码引用 longintrepr.h,
+# 该头在 Python 3.13+ 已被删除, 所以必须锁 Python <= 3.11 才能编译通过。
+# 锁 3.10.12(社区验证可编译可运行), hostpython3 必须同一版本。
+requirements = python3==3.10.12,hostpython3==3.10.12,pygame
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
 fullscreen = 1
 
-# 双架构: 同时支持 32 位(armeabi-v7a)和 64 位(arm64-v8a)手机,
-# 否则很老或个别国产 32 位机型会因 ABI 不匹配直接打开即退
-android.arch = armeabi-v7a,arm64-v8a
+# iQOO 15 等现代手机都是 64 位, 只打 arm64 即可(体积更小、编译更快)
+android.arch = arm64-v8a
 android.api = 33
 # 必须 >= 24: Python 3.14 的 remote_debugging 用到 preadv/pwritev,
 # bionic 从 API 24 才提供, minapi=23 时会报 "call to undeclared function" 硬错误
