@@ -14,11 +14,11 @@ source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VE
 # 版本(与 VERSION.txt 保持一致)
 version = 1.00
 
-# 依赖: python3 + pygame
-# 注意: p4a 内置的是老版 pygame 2.1.0, 它的 C 代码引用 longintrepr.h,
-# 该头在 Python 3.13+ 已被删除, 所以必须锁 Python <= 3.11 才能编译通过。
-# 锁 3.10.12(社区验证可编译可运行), hostpython3 必须同一版本。
-requirements = python3==3.10.12,hostpython3==3.10.12,pygame
+# 依赖: python3 + pygame-ce
+# p4a 自带 pygame-ce recipe(不是老版 pygame 2.1.0)。pygame-ce 在 Python 3.12 上
+# 编译/运行都稳。具体 Python 版本由 workflow 里 sed 改 p4a 的 python3 recipe 决定
+# (p4a 默认 3.14.2 在安卓上运行会崩溃, buildozer 的 == 覆盖语法在本环境无效, 故用 sed)。
+requirements = python3,pygame-ce
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
