@@ -15,10 +15,13 @@ source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VE
 version = 1.00
 
 # 依赖: python3 + pygame-ce
-# p4a 自带 pygame-ce recipe(不是老版 pygame 2.1.0)。pygame-ce 在 Python 3.12 上
-# 编译/运行都稳。具体 Python 版本由 workflow 里 sed 改 p4a 的 python3 recipe 决定
-# (p4a 默认 3.14.2 在安卓上运行会崩溃, buildozer 的 == 覆盖语法在本环境无效, 故用 sed)。
-requirements = python3,pygame-ce
+# p4a 自带 pygame-ce recipe(pygame_ce 2.5.8, 现代版本, 在 Python 3.12 上编译/运行均稳)。
+# 关键: 必须把 Python 锁到 3.12 (p4a 默认 3.14, 在安卓上运行会"打开即闪退")。
+# 通过 requirements 的 == 固定版本; 同时在 workflow 里 rm -rf .buildozer 强制重建 dist,
+# 否则缓存里的 3.14 dist 会被复用、== 覆盖不生效。
+# (注意: 曾经用的 "sed 改 p4a recipe" 方案不可行 —— buildozer 是 clone p4a 而非 pip 安装,
+#  sed 步骤 import pythonforandroid 会 ModuleNotFoundError, 反而让整个 job 失败。)
+requirements = python3==3.12.10,hostpython3==3.12.10,pygame-ce
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
