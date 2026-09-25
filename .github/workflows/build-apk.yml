@@ -30,6 +30,17 @@ jobs:
             libssl-dev libltdl-dev
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
 
+      # 缓存 SDK/NDK(约 2GB), 重试时能省掉十几分钟下载
+      - name: 缓存 Buildozer 全局目录
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-ndk-v1
+          restore-keys: |
+            buildozer-ndk-
+
       - name: 安装 Buildozer
         run: |
           python -m pip install --upgrade pip
