@@ -30,14 +30,17 @@ jobs:
             libssl-dev libltdl-dev
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
 
-      # 缓存 SDK/NDK(约 2GB), 重试时能省掉十几分钟下载
+      # 缓存 SDK/NDK + 编译产物
+      # key 换新(buildozer-py312-v1): 后续命中会直接复用 SDK/NDK 与 3.12 的 dist
+      # restore-keys 保留旧前缀 buildozer-ndk-: 第一次能复用之前下载好的 SDK/NDK(省 ~15 分钟)
+      # 但旧的 .buildozer 里是 Python 3.14 的 dist, 必须在编译前 rm 掉, 否则 sed 降版本不生效
       - name: 缓存 Buildozer 全局目录
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-ndk-v1
+          key: buildozer-py312-v1
           restore-keys: |
             buildozer-ndk-
 
@@ -46,23 +49,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install buildozer cython
 
-      - name: 把 p4a 内置 Python 降到 3.12(3.14 在安卓上运行时崩溃, buildozer 的 == 覆盖无效)
+      - name: 把 p4a 内置 Python 降到 3.12
         run: |
-          F=$(python -c "import pythonforandroid as p,os;print(os.path.join(os.path.dirname(p.__file__),'recipes','python3','__init__.py'))")
-          echo "patching $F"
-          grep -n "version = " "$F" | head -n 5
-          # 把 python3 recipe 的默认版本 3.14.x 改成 3.12.10
-          sed -i "s/version = '3\.14[^']*'/version = '3.12.10'/" "$F"
-          grep -n "version = " "$F" | head -n 5
+          python - <<'PY'
+          import os, re, pythonforandroid as p
+          f = os.path.join(os.path.dirname(p.__file__), 'recipes', 'python3', '__init__.py')
+          s = open(f, encoding='utf-8').read()
+          # 兼容单/双引号, 把 3.14.x 改成 3.12.10 (3.14 在安卓上运行时崩溃/编译 longintrepr.h 缺失)
+          s2, n = re.subn(r"version\s*=\s*['\"]3\.14[^\"']*['\"]", "version = '3.12.10'", s, count=1)
+          open(f, 'w', encoding='utf-8').write(s2)
+          print("patched %s (count=%d)" % (f, n))
+          for line in s2.splitlines():
+              if 'version' in line:
+                  print("  ", line.strip())
+          PY
+
+      - name: 丢弃旧的 3.14 dist(关键: 否则 sed 降版本不重新编译)
+        run: |
+          rm -rf .buildozer
+          echo "已清理 .buildozer, 将用 Python 3.12 重新构建 dist"
 
       - name: 编译 APK(首次约 20-40 分钟, 会自动下载 Android SDK/NDK)
         run: |
           buildozer -v android debug
 
-      - name: 若 pygame-ce 包名不可用则回退重试
+      - name: 若首次构建异常则清理重试一次
         if: failure()
         run: |
-          sed -i 's/^requirements = .*/requirements = python3,pygame/' buildozer.spec
           rm -rf .buildozer
           buildozer -v android debug
 
