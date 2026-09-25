@@ -39,6 +39,11 @@ SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随�
 
 # 本文件所在目录(打包成 apk 后也是资源根目录)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 是否运行在 Android(python-for-android 会设置这些环境变量)
+IS_ANDROID = (sys.platform == "android"
+              or "ANDROID_ARGUMENT" in os.environ
+              or "ANDROID_PRIVATE" in os.environ
+              or "ANDROID_APP_PATH" in os.environ)
 # 内置中文字体: 手机(Android)上系统里没有微软雅黑/黑体, 不内嵌的话中文全是方块
 FONT_FALLBACKS = ["microsoftyaheiui", "microsoftyahei", "simhei",
                   "notosanscjk", "wenquanyi", "arial"]
@@ -498,15 +503,27 @@ class State(Enum):
 class Game:
     def __init__(self):
         pygame.init()
-        try:
-            self.screen = pygame.display.set_mode(
-                (WIDTH, HEIGHT), pygame.SCALED, vsync=1)
-        except Exception:
+        # 安卓上 SDL 的 SCALED / 指定尺寸窗口都不稳, 直接交给 SDL 做全屏,
+        # 再由 _present() 等比缩放到真实屏幕(桌面端保持原行为)
+        if IS_ANDROID:
             try:
-                self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-            except Exception:
-                # 安卓/特殊设备: 交给 SDL 自己决定分辨率, 由 _present 缩放适配
                 self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            except Exception:
+                try:
+                    self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+                except Exception:
+                    self.screen = pygame.display.set_mode(
+                        (WIDTH, HEIGHT), pygame.SCALED, vsync=1)
+        else:
+            try:
+                self.screen = pygame.display.set_mode(
+                    (WIDTH, HEIGHT), pygame.SCALED, vsync=1)
+            except Exception:
+                try:
+                    self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+                except Exception:
+                    # 安卓/特殊设备: 交给 SDL 自己决定分辨率, 由 _present 缩放适配
+                    self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
         pygame.display.set_caption(f"{APP_NAME} v{VERSION} - 3D 点球大战")
         self.clock = pygame.time.Clock()
         if SEED is not None:
@@ -2140,7 +2157,12 @@ class Game:
     def _present(self, target: pygame.Surface, canvas: pygame.Surface):
         """把 1280x800 画布等比缩放贴到真实屏幕(letterbox 居中)."""
         tw, th = target.get_size()
+        # 安卓上 SDL 偶尔会给出 0 尺寸 surface, 不拦住的话下面会除零/缩放崩溃
+        if tw <= 0 or th <= 0:
+            return
         scale = min(tw / WIDTH, th / HEIGHT)
+        if scale <= 0:
+            return
         dw, dh = max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))
         target.fill((0, 0, 0))
         if (dw, dh) == (WIDTH, HEIGHT):
@@ -2155,9 +2177,13 @@ class Game:
             tw, th = self.screen.get_size()
         except Exception:
             return 1.0, 0.0, 0.0
+        if tw <= 0 or th <= 0:
+            return 1.0, 0.0, 0.0
         if (tw, th) == (WIDTH, HEIGHT):
             return 1.0, 0.0, 0.0
         scale = min(tw / WIDTH, th / HEIGHT)
+        if scale <= 0:
+            return 1.0, 0.0, 0.0
         dw, dh = WIDTH * scale, HEIGHT * scale
         return scale, (tw - dw) / 2.0, (th - dh) / 2.0
 
