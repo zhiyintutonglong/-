@@ -46,6 +46,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install buildozer cython
 
+      - name: 把 p4a 内置 Python 降到 3.12(3.14 在安卓上运行时崩溃, buildozer 的 == 覆盖无效)
+        run: |
+          F=$(python -c "import pythonforandroid as p,os;print(os.path.join(os.path.dirname(p.__file__),'recipes','python3','__init__.py'))")
+          echo "patching $F"
+          grep -n "version = " "$F" | head -n 5
+          # 把 python3 recipe 的默认版本 3.14.x 改成 3.12.10
+          sed -i "s/version = '3\.14[^']*'/version = '3.12.10'/" "$F"
+          grep -n "version = " "$F" | head -n 5
+
       - name: 编译 APK(首次约 20-40 分钟, 会自动下载 Android SDK/NDK)
         run: |
           buildozer -v android debug
