@@ -49,20 +49,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install buildozer cython
 
-      - name: 把 p4a 内置 Python 降到 3.12
-        run: |
-          F=$(python -c "import pythonforandroid as p,os;print(os.path.join(os.path.dirname(p.__file__),'recipes','python3','__init__.py'))")
-          echo "patching $F"
-          grep -n "version = " "$F" | head -n 5
-          # 把 python3 recipe 的默认版本 3.14.x 改成 3.12.10
-          # (3.14 在安卓上运行会崩溃 + 编译 longintrepr.h 缺失; buildozer 的 == 覆盖语法在本环境无效, 故用 sed)
-          sed -i "s/version = '3\.14[^']*'/version = '3.12.10'/" "$F"
-          grep -n "version = " "$F" | head -n 5
+      # 注意: 不要在这里用 `sed` 改 p4a 的 python3 recipe —— buildozer 是 clone p4a 而不是
+      # pip 安装, 该步骤 `import pythonforandroid` 会 ModuleNotFoundError 并让整个 job 失败。
+      # Python 版本统一在 buildozer.spec 的 requirements = python3==3.12.10 里固定。
 
-      - name: "丢弃旧的 3.14 dist(关键: 否则 sed 降版本不重新编译)"
+      - name: "清理旧 dist / 克隆的 p4a(关键: 否则缓存里的 3.14 被复用, == 覆盖不生效)"
         run: |
           rm -rf .buildozer
-          echo "已清理 .buildozer, 将用 Python 3.12 重新构建 dist"
+          rm -rf ~/.buildozer/android/platform/python-for-android
+          echo "已清理 .buildozer 与克隆的 p4a, 将用 Python 3.12 重新构建"
 
       - name: 编译 APK(首次约 20-40 分钟, 会自动下载 Android SDK/NDK)
         run: |
