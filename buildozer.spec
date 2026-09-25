@@ -26,7 +26,9 @@ fullscreen = 1
 # 需要兼容很老的设备就改成: armeabi-v7a,arm64-v8a
 android.arch = arm64-v8a
 android.api = 33
-android.minapi = 23
+# 必须 >= 24: Python 3.14 的 remote_debugging 用到 preadv/pwritev,
+# bionic 从 API 24 才提供, minapi=23 时会报 "call to undeclared function" 硬错误
+android.minapi = 24
 android.permissions =
 android.allow_backup = True
 # 自动接受 Android SDK 协议(云端无人值守编译必须)
