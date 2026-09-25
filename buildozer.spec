@@ -15,13 +15,15 @@ source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VE
 version = 1.00
 
 # 依赖: python3 + pygame-ce
-# p4a 自带 pygame-ce recipe(pygame_ce 2.5.8, 现代版本, 在 Python 3.12 上编译/运行均稳)。
-# 关键: 必须把 Python 锁到 3.12 (p4a 默认 3.14, 在安卓上运行会"打开即闪退")。
-# 通过 requirements 的 == 固定版本; 同时在 workflow 里 rm -rf .buildozer 强制重建 dist,
-# 否则缓存里的 3.14 dist 会被复用、== 覆盖不生效。
-# (注意: 曾经用的 "sed 改 p4a recipe" 方案不可行 —— buildozer 是 clone p4a 而非 pip 安装,
-#  sed 步骤 import pythonforandroid 会 ModuleNotFoundError, 反而让整个 job 失败。)
-requirements = python3==3.12.10,hostpython3==3.12.10,pygame-ce
+# 版本锁定(踩坑经验, 重要):
+#  - p4a 默认 Python 3.14: 在安卓上打开即闪退(已验证能编过但运行不稳), 不能用。
+#  - Python 3.12/3.13: 编译期会挂 —— 其 configure 加了 -Werror=implicit-function-declaration,
+#    而 CPython 的 Modules/grpmodule.c 里 setgrent/getgrent 在 bionic 下未声明 -> 硬错误。
+#    (实测锁 3.12.10 + NDK r25b 仍然报同样的 [-Werror,-Wimplicit-function-declaration], NDK 无解。)
+#  - 所以锁到 3.11.x: 3.11 的 configure 还没加该 -Werror, grpmodule 仅警告、可正常编过;
+#    且 3.11 是 p4a/pygame 在安卓上最稳的组合之一, 也避开了 3.14 的运行时问题。
+#  - 同时 workflow 里 rm -rf .buildozer 强制重建 dist, 避免缓存复用旧 Python。
+requirements = python3==3.11.9,hostpython3==3.11.9,pygame-ce
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
