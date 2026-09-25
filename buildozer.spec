@@ -29,6 +29,9 @@ fullscreen = 1
 
 # iQOO 15 等现代手机都是 64 位, 只打 arm64 即可(体积更小、编译更快)
 android.arch = arm64-v8a
+# 锁定 NDK r25b: 其 Clang 14 不会把 Python 3.12 grpmodule.c 里的 setgrent/getgrent
+# 隐式声明当硬错误(新版 NDK Clang16+ 会, 导致 3.12 编译失败)。r25b 是 p4a 官方推荐版本。
+android.ndk = 25b
 android.api = 33
 # 必须 >= 24: Python 3.14 的 remote_debugging 用到 preadv/pwritev,
 # bionic 从 API 24 才提供, minapi=23 时会报 "call to undeclared function" 硬错误
