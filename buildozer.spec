@@ -38,10 +38,10 @@ android.allow_backup = True
 # 自动接受 Android SDK 协议(云端无人值守编译必须)
 android.accept_sdk_license = True
 
-# 图标/启动图(可选; 准备好图片后取消注释)
-# icon.filename = %(source.dir)s/assets/icon.png
-# presplash.filename = %(source.dir)s/assets/presplash.png
-presplash.color = #1B5E20
+# 图标/启动图(v1.01: 兔子踢球简笔画, buildozer 会用 Pillow 自动生成各尺寸 mipmap)
+icon.filename = %(source.dir)s/icon.jpg
+presplash.filename = %(source.dir)s/icon.jpg
+presplash.color = #FFFFFF
 
 [buildozer]
 log_level = 2
