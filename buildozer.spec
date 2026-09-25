@@ -29,6 +29,8 @@ android.api = 33
 android.minapi = 23
 android.permissions =
 android.allow_backup = True
+# 自动接受 Android SDK 协议(云端无人值守编译必须)
+android.accept_sdk_license = True
 
 # 图标/启动图(可选; 准备好图片后取消注释)
 # icon.filename = %(source.dir)s/assets/icon.png
