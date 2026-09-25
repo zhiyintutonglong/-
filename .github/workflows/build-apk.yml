@@ -51,20 +51,15 @@ jobs:
 
       - name: 把 p4a 内置 Python 降到 3.12
         run: |
-          python - <<'PY'
-          import os, re, pythonforandroid as p
-          f = os.path.join(os.path.dirname(p.__file__), 'recipes', 'python3', '__init__.py')
-          s = open(f, encoding='utf-8').read()
-          # 兼容单/双引号, 把 3.14.x 改成 3.12.10 (3.14 在安卓上运行时崩溃/编译 longintrepr.h 缺失)
-          s2, n = re.subn(r"version\s*=\s*['\"]3\.14[^\"']*['\"]", "version = '3.12.10'", s, count=1)
-          open(f, 'w', encoding='utf-8').write(s2)
-          print("patched %s (count=%d)" % (f, n))
-          for line in s2.splitlines():
-              if 'version' in line:
-                  print("  ", line.strip())
-          PY
+          F=$(python -c "import pythonforandroid as p,os;print(os.path.join(os.path.dirname(p.__file__),'recipes','python3','__init__.py'))")
+          echo "patching $F"
+          grep -n "version = " "$F" | head -n 5
+          # 把 python3 recipe 的默认版本 3.14.x 改成 3.12.10
+          # (3.14 在安卓上运行会崩溃 + 编译 longintrepr.h 缺失; buildozer 的 == 覆盖语法在本环境无效, 故用 sed)
+          sed -i "s/version = '3\.14[^']*'/version = '3.12.10'/" "$F"
+          grep -n "version = " "$F" | head -n 5
 
-      - name: 丢弃旧的 3.14 dist(关键: 否则 sed 降版本不重新编译)
+      - name: "丢弃旧的 3.14 dist(关键: 否则 sed 降版本不重新编译)"
         run: |
           rm -rf .buildozer
           echo "已清理 .buildozer, 将用 Python 3.12 重新构建 dist"
