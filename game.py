@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.06"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.07"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -254,26 +254,54 @@ def _shot_speed(frac, attr, fatigue, skill=False):
         base *= POWER_SHOT_BOOST
     return max(6.0, base)
 
+# 缓存 Vibrator 句柄: 第一次成功拿到后复用; 若确认拿不到则置 False 直接跳过.
+_vibrator = None
+
 def _android_vibrate(ms):
     # 手机端震动反馈; 非安卓 / 无权限时静默跳过. 必须在主线程调用.
+    global _vibrator
     if not IS_ANDROID:
+        return
+    if _vibrator is False:
         return
     try:
         from jnius import autoclass
-        Context = autoclass("android.content.Context")
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        ctx = PythonActivity.mActivity
-        vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
-        if vib is None:
-            return
+        if _vibrator is None:
+            # 尽量拿到 Vibrator: 先试 PythonActivity, 失败再试 Application Context.
+            # (实测部分机型/打包方式下 mActivity 取不到, 走 ActivityThread 兜底.)
+            ctx = None
+            try:
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                ctx = PythonActivity.mActivity
+            except Exception:
+                ctx = None
+            if ctx is None:
+                try:
+                    ActivityThread = autoclass("android.app.ActivityThread")
+                    ctx = ActivityThread.currentApplication()
+                except Exception:
+                    ctx = None
+            if ctx is None:
+                _vibrator = False
+                return
+            Context = autoclass("android.content.Context")
+            vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
+            if vib is None:
+                _vibrator = False
+                return
+            _vibrator = vib
+        vib = _vibrator
         try:
             VibrationEffect = autoclass("android.os.VibrationEffect")
-            vib.vibrate(VibrationEffect.createOneShot(
-                int(ms), VibrationEffect.DEFAULT_AMPLITUDE))
+            # 中等强度短震(默认振幅在部分机型上几乎无感, 这里用 200/255 确保能感知)
+            vib.vibrate(VibrationEffect.createOneShot(int(ms), 200))
         except Exception:
-            vib.vibrate(int(ms))
+            try:
+                vib.vibrate(int(ms))
+            except Exception:
+                _vibrator = False
     except Exception:
-        pass
+        _vibrator = False
 
 CORNER_CELLS = {1, 3, 7, 9}
 KEY_TO_CELL = {
@@ -866,6 +894,9 @@ class Game:
         self.ai_skill_charge = 0
         self.precision_shot_used = False
         self.ai_precision_used = False
+        # AI 整场固定一名射手 + 一名门将, 与玩家对等(不再每个球换人)
+        self.ai_striker_profile = random.choice(STRIKERS)
+        self.ai_keeper_profile = random.choice(KEEPERS)
         self.power_shot_active = False
         self.selected_skill = "normal"
         self.ai_selected_skill = "normal"
@@ -941,8 +972,11 @@ class Game:
 
     def _ai_decide_shot(self):
         """AI 决定射门目标 + 力度 - 智能策略系统."""
-        self.ai_striker_profile = random.choice(STRIKERS)
+        # 整场固定一名射手(在 reset_match 里已选定), 这里只取用, 不再换人
         ai_sp = self.ai_striker_profile
+        if ai_sp is None:
+            ai_sp = random.choice(STRIKERS)
+            self.ai_striker_profile = ai_sp
         cells = list(CELL_CENTERS.keys())
 
         # 1. 比分形势分析: 落后=激进, 领先=保守, 平局=正常
@@ -1036,8 +1070,11 @@ class Game:
 
     def _ai_decide_dive(self):
         """AI 决定扑救方向 - 学习玩家射门模式."""
-        self.ai_keeper_profile = random.choice(KEEPERS)
+        # 整场固定一名门将(在 reset_match 里已选定), 这里只取用, 不再换人
         ai_kp = self.ai_keeper_profile
+        if ai_kp is None:
+            ai_kp = random.choice(KEEPERS)
+            self.ai_keeper_profile = ai_kp
         cells = list(CELL_CENTERS.keys())
 
         # 1. 比分形势: 落后=赌边角, 领先=守中路
@@ -2288,7 +2325,7 @@ class Game:
             self.shake_t = max(self.shake_t, 0.45)
             self.shake_amp = max(self.shake_amp, 11)
             if IS_ANDROID:
-                _android_vibrate(45)
+                _android_vibrate(80)
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
