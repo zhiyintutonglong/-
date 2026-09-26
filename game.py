@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.09"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.10"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -2462,21 +2462,24 @@ class Game:
                 self.match_stats["ai_skill_uses"] += 1
             if is_power:
                 self.match_stats["ai_power_shots"] += 1
-        # 两端一致反馈(v1.09): 手机"来电式"震动 + 桌面画面震动.
-        # 震动根因已修复(切主线程), 这里把画面震动移出 IS_ANDROID 守卫, 桌面端也震.
+        # 两端一致反馈(v1.10): 手机"来电式"震动 + 桌面画面震动.
+        # 震动根因已修复(切主线程).
+        # 规则(v1.10): 普通进球 / 普通扑救 均不震动;
+        #             超大力进球 -> 280ms 强震(来电式);
+        #             扑出"大力射门"(被扑出球速>=25) -> 110ms.
         oc = self.last_outcome
         if oc == "GOAL":
-            if is_power:
+            if is_power:                     # 超大力进球: 来电式强震
                 self.shake_t = max(self.shake_t, 0.45)
                 self.shake_amp = max(self.shake_amp, 11)
                 if IS_ANDROID:
                     _android_vibrate(280)
-            else:
+            # 普通进球: 不震动
+        elif oc == "SAVE":
+            if is_power:                     # 扑出的是大力射门 -> 110ms
                 if IS_ANDROID:
                     _android_vibrate(110)
-        elif oc == "SAVE":
-            if IS_ANDROID:
-                _android_vibrate(150)
+            # 普通扑救: 不震动
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
