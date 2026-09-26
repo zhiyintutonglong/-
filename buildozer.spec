@@ -20,15 +20,20 @@ version = 1.01
 #  - Python 3.12/3.13: 编译期会挂 —— 其 configure 加了 -Werror=implicit-function-declaration,
 #    而 CPython 的 Modules/grpmodule.c 里 setgrent/getgrent 在 bionic 下未声明 -> 硬错误。
 #    (实测锁 3.12.10 + NDK r25b 仍然报同样的 [-Werror,-Wimplicit-function-declaration], NDK 无解。)
-#  - 所以锁到 3.11.x: 3.11 的 configure 还没加该 -Werror, grpmodule 仅警告、可正常编过;
-#    且 3.11 是 p4a/pygame 在安卓上最稳的组合之一, 也避开了 3.14 的运行时问题。
+#  - 最终锁到 3.10.x, 两个原因(缺一不可):
+#    1) 3.10 的 configure 还没加该 -Werror, grpmodule 不会因 setgrent 报错;
+#    2) **关键**: p4a 的 pygame recipe 编的是 pygame 2.1.0, 其 src_c/_sdl2/sdl2.c 里是
+#       `#include "longintrepr.h"`(不带 cpython/ 前缀)。Python 3.11 起该头文件被移到
+#       Include/cpython/ 子目录, 3.12+ 更是直接删除 —— 实测 3.11.9 下 pygame 编译直接
+#       fatal error: 'longintrepr.h' file not found。只有 Python 3.10 及更早版本
+#       把它放在 Include/ 顶层, pygame 2.1.0 才能编过。
 #  - 同时 workflow 里 rm -rf .buildozer 强制重建 dist, 避免缓存复用旧 Python。
 # 依赖名必须用 p4a 的 recipe 名 `pygame`(p4a 只有 pygame 这一个 recipe, 它下载 pygame 2.1.0 源码
 # 并交叉编译成 arm64)。绝不能写 `pygame-ce`/`pygame_ce` —— p4a 没有该 recipe 会 fallback 到 pip,
 # 在 x86_64 的 CI 主机上装 manylinux 的 x86_64 轮子, 导致 base.so 全是 X86_64,
 # 手机 dlopen 报 "is for EM_X86_64 (62) instead of EM_AARCH64 (183)" 直接闪退
 # (这就是 v1.00 闪退的真正原因, 与 Python 版本无关)。
-requirements = python3==3.11.9,hostpython3==3.11.9,pygame
+requirements = python3==3.10.13,hostpython3==3.10.13,pygame
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
