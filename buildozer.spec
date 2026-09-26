@@ -9,10 +9,10 @@ source.dir = .
 # 需要打进 apk 的文件类型(字体必须是 ttf)
 source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 # 排除临时/测试文件
-source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt
+source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt,debug.keystore
 
-# 版本(与 VERSION.txt 保持一致)
-version = 1.08
+# 版本(与 game.py 的 VERSION 常量保持一致)
+version = 1.09
 
 # 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
 # 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
@@ -55,6 +55,13 @@ android.api = 33
 android.minapi = 24
 android.permissions = VIBRATE
 android.allow_backup = True
+# 固定签名: 用仓库内置的 debug.keystore 签名, 保证新版本可直接"覆盖安装",
+# 不必先卸载旧版(否则 CI 每次用随机 keystore 会导致签名不一致, 安装被拒).
+# 该文件已加入 source.exclude_patterns, 不会打进 APK, 仅用于本地签名.
+android.keystore_path = %(source.dir)s/debug.keystore
+android.keyalias = dqls
+android.keystore_password = dqls1234
+android.keyalias_password = dqls1234
 # 自动接受 Android SDK 协议(云端无人值守编译必须)
 android.accept_sdk_license = True
 
