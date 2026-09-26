@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.04"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.05"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -44,6 +44,10 @@ SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随�
 # 关掉后只保留手指事件, 由 handle_event 统一处理(另有去重兜底)。
 os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
 
+# 画面放大交给 GPU 时用线性过滤(双线性), 而不是最邻近 —— 大屏上不会出硬锯齿。
+# 只在 SCALED(GPU 缩放)模式下有意义, 对软件缩放路径无任何影响。
+os.environ.setdefault("SDL_RENDER_SCALE_QUALITY", "1")
+
 # 本文件所在目录(打包成 apk 后也是资源根目录)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 是否运行在 Android(python-for-android 会设置这些环境变量)
@@ -51,10 +55,11 @@ IS_ANDROID = (sys.platform == "android"
               or "ANDROID_ARGUMENT" in os.environ
               or "ANDROID_PRIVATE" in os.environ
               or "ANDROID_APP_PATH" in os.environ)
-# 手机屏幕分辨率很高(如 2K 屏), 每帧软件缩放的像素量是桌面的数倍,
-# 目标帧率降到 30 让帧时间更宽松、更稳(游戏逻辑用 dt, 不掉速)
-if IS_ANDROID:
-    FPS = 30
+# 手机端同样是 60 帧。
+# (v1.05 之前这里写的是 FPS = 30 —— 那是个错误决定: 帧率降了并不会让每帧变快,
+#  反而让"一帧的时间"变长, 一旦手机跑不满 30 帧, dt 又被截断成 1/30,
+#  游戏就整体变成慢动作 —— 玩家看到的"球飞得慢、门将反应慢"就是这么来的。)
+# 现在帧率固定 60, 帧时间不够就靠"减少每帧工作量"(见 _set_mode_scaled)解决。
 # 内置中文字体: 手机(Android)上系统里没有微软雅黑/黑体, 不内嵌的话中文全是方块
 FONT_FALLBACKS = ["microsoftyaheiui", "microsoftyahei", "simhei",
                   "notosanscjk", "wenquanyi", "arial"]
@@ -549,29 +554,79 @@ class State(Enum):
 # 游戏主类
 # ====================================================================
 class Game:
+    # ----------------------------------------------------------------
+    # 显示模式(手机端能不能跑满 60 帧, 几乎全看这里)
+    # ----------------------------------------------------------------
+    def _window_size(self):
+        """SDL 窗口的真实像素尺寸。
+
+        注意: SCALED 模式下 screen.get_size() 是"逻辑尺寸"(1280x800),
+        而窗口本身可能是 3168x1440 —— 触摸坐标换算必须用真实窗口尺寸,
+        否则黑边区域会让点击整体偏移。
+        """
+        try:
+            w, h = pygame.display.get_window_size()
+            if w > 0 and h > 0:
+                return int(w), int(h)
+        except Exception:
+            pass
+        try:
+            info = pygame.display.Info()
+            if getattr(info, "current_w", 0) > 0 and getattr(info, "current_h", 0) > 0:
+                return int(info.current_w), int(info.current_h)
+        except Exception:
+            pass
+        try:
+            return pygame.display.get_surface().get_size()
+        except Exception:
+            return WIDTH, HEIGHT
+
+    def _init_display(self):
+        """挑一种显示模式。手机端优先 SCALED —— 这是本次提速的关键。
+
+        旧方案((0,0)+FULLSCREEN, 拿手机真实分辨率):
+            每帧要先用 CPU 把 1280x800 软件放大到 2304x1440(几百万像素),
+            再把这一整块(十几 MB)上传给 SDL 的纹理。手机上这两项加起来
+            能吃掉 20~30ms —— 60 帧的预算才 16.7ms, 根本不可能达标,
+            于是只能跑到 20 帧出头, 再叠加 dt 截断就成了慢动作。
+
+        新方案(SCALED):
+            画面依然按 1280x800 绘制(逻辑分辨率), 由 SDL/GPU 等比放大到
+            全屏并居中留黑边。CPU 一次都不用放大, 上传量也只有原来的 1/3,
+            而且 GPU 放大还是双线性的, 比原来的最邻近更好看。
+        """
+        scaled = getattr(pygame, "SCALED", 0)
+        if IS_ANDROID and scaled:
+            try:
+                pygame.display.set_mode((WIDTH, HEIGHT),
+                                        pygame.FULLSCREEN | scaled)
+                surf = pygame.display.get_surface()
+                # 必须拿到真实窗口尺寸, 否则触摸坐标无从换算(见 _window_size)
+                w, h = self._window_size()
+                if surf is not None and surf.get_size() == (WIDTH, HEIGHT) and (w, h) != (0, 0):
+                    return surf
+            except Exception:
+                pass
+            # 退回老办法: 拿真实分辨率, 由 _present() 自己软件缩放
+            try:
+                return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            except Exception:
+                return pygame.display.set_mode((WIDTH, HEIGHT))
+        # 桌面端: 1:1 窗口(SCALED 让窗口可自由拉伸且不变形)
+        try:
+            return pygame.display.set_mode((WIDTH, HEIGHT), scaled, vsync=1)
+        except Exception:
+            try:
+                return pygame.display.set_mode((WIDTH, HEIGHT))
+            except Exception:
+                return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+
     def __init__(self):
         pygame.init()
-        # 安卓上 SDL 的 SCALED / 指定尺寸窗口都不稳, 直接交给 SDL 做全屏,
-        # 再由 _present() 等比缩放到真实屏幕(桌面端保持原行为)
-        if IS_ANDROID:
-            try:
-                self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-            except Exception:
-                try:
-                    self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-                except Exception:
-                    self.screen = pygame.display.set_mode(
-                        (WIDTH, HEIGHT), pygame.SCALED, vsync=1)
-        else:
-            try:
-                self.screen = pygame.display.set_mode(
-                    (WIDTH, HEIGHT), pygame.SCALED, vsync=1)
-            except Exception:
-                try:
-                    self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-                except Exception:
-                    # 安卓/特殊设备: 交给 SDL 自己决定分辨率, 由 _present 缩放适配
-                    self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        # 窗口真实像素尺寸(可能与绘制表面尺寸不同, 见下面的 SCALED)
+        self._win_w, self._win_h = WIDTH, HEIGHT
+        self.screen = self._init_display()
+        self._win_w, self._win_h = self._window_size()
         pygame.display.set_caption(f"{APP_NAME} v{VERSION} - 3D 点球大战")
         self.clock = pygame.time.Clock()
         if SEED is not None:
@@ -595,6 +650,8 @@ class Game:
         self._scene_cache: Optional[pygame.Surface] = None   # 天空+看台+草地 合成图
         self._stands_cache: Optional[pygame.Surface] = None  # 看台 + 观众
         self._net_cache: Optional[pygame.Surface] = None     # 球网(半透明)
+        self._net_small: Optional[pygame.Surface] = None     # 球网(裁剪到球门那一小块)
+        self._net_rect: Tuple[int, int, int, int] = (0, 0, WIDTH, HEIGHT)
         self._grid_cache: Optional[pygame.Surface] = None    # 九宫格网格线(整屏, 备用)
         self._grid_small: Optional[pygame.Surface] = None    # 九宫格网格线(只球门一小块)
         self._grid_rect: Tuple[int, int, int, int] = (0, 0, WIDTH, HEIGHT)
@@ -1094,10 +1151,10 @@ class Game:
         if ev.type in (getattr(pygame, "FINGERDOWN", -1),
                        getattr(pygame, "FINGERMOTION", -2),
                        getattr(pygame, "FINGERUP", -3)):
-            try:
-                tw, th = self.screen.get_size()
-            except Exception:
-                tw, th = WIDTH, HEIGHT
+            # 触屏给的是 0~1 的归一化坐标, 必须乘"窗口真实像素尺寸"——
+            # SCALED 模式下 screen.get_size() 是 1280x800 的逻辑尺寸,
+            # 乘它的话黑边区域会被算进去, 点击整体偏移。
+            tw, th = self._win_w, self._win_h
             cpos = self._to_canvas_pos((ev.x * tw, ev.y * th))
             already_canvas = True
             if ev.type == getattr(pygame, "FINGERDOWN", -1):
@@ -1800,7 +1857,9 @@ class Game:
         if self.ball.active:
             b = self.ball
             # 固定子步长积分(保证与弹道求解器完全一致, 且帧率无关)
-            remaining = min(dt, 0.05)   # 卡顿时最多补 50ms, 防止穿模
+            # 这里的上限必须 >= run() 里 dt 的上限(0.10), 否则掉帧时球会"补不回来",
+            # 越卡球飞得越慢 —— 这正是手机上观感变慢的元凶之一。
+            remaining = min(dt, 0.12)
             while remaining > 1e-6:
                 h = min(PHYS_DT, remaining)
                 pos = [b.x, b.y, b.z]
@@ -2391,10 +2450,15 @@ class Game:
 
     def _scale_factor(self) -> Tuple[float, float, float]:
         """真实屏幕 -> 画布 的缩放与偏移, 供鼠标/触摸坐标反算."""
-        try:
-            tw, th = self.screen.get_size()
-        except Exception:
-            return 1.0, 0.0, 0.0
+        # 安卓上用窗口真实像素尺寸, 而不是 screen.get_size():
+        # SCALED 模式下后者是 1280x800 的逻辑尺寸, 拿它算会把黑边算漏。
+        # 桌面端窗口大小本来就等于绘制尺寸, 保持原来的算法即可。
+        tw, th = (self._win_w, self._win_h) if IS_ANDROID else (0, 0)
+        if tw <= 0 or th <= 0:
+            try:
+                tw, th = self.screen.get_size()
+            except Exception:
+                return 1.0, 0.0, 0.0
         if tw <= 0 or th <= 0:
             return 1.0, 0.0, 0.0
         if (tw, th) == (WIDTH, HEIGHT) and self._present_cap >= 1.0:
@@ -2995,6 +3059,16 @@ class Game:
         net = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         self._draw_net(net)
         self._net_cache = net
+        # 球网只占球门那一小块, 但上面是一整张 1280x800 的半透明图 ——
+        # 每帧整屏 alpha 混合很贵(实测 0.6ms/帧, 手机上要几 ms)。
+        # 这里一次性量出真正有内容的包围盒, 之后只贴这一小块。
+        try:
+            r = net.get_bounding_rect()
+            if r.width > 0 and r.height > 0:
+                self._net_rect = (r.x, r.y, r.width, r.height)
+                self._net_small = net.subsurface(r).copy()
+        except Exception:
+            pass
 
         grid = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         self._draw_grid_lines(grid)
@@ -3236,7 +3310,12 @@ class Game:
         # 球网: 静态图层, 只构建一次后每帧直接贴
         # (原来每帧新建两块 1280x800 的 SRCALPHA surface, 是最大的性能瓶颈之一)
         self._ensure_static_layers()
-        screen.blit(self._net_cache, (ox, oy))
+        # 只贴球门那一小块(整屏半透明混合太贵); 拿不到小块时退回整张
+        if self._net_small is not None:
+            nx, ny, nw, nh = self._net_rect
+            screen.blit(self._net_small, (nx + ox, ny + oy))
+        else:
+            screen.blit(self._net_cache, (ox, oy))
 
         # 立柱(白) - 带阴影
         post_w = max(3, int(0.12 * fl_b[2]))
@@ -4326,35 +4405,29 @@ class Game:
     # 主循环
     # ----------------------------------------------------------------
     def _adapt_quality(self, work_ms: float, frame_dt: float):
-        """手机端自适应流畅度: 按实测帧耗时在 60/30 帧之间自动取舍.
+        """只做一件事: 保证帧率目标恒为 60, 并且画面永远铺满。
 
-        重要约定: 只调帧率, 绝不缩小画面。
-        用户明确要求"不要压缩, 空间无所谓" —— 画面一旦缩小,
-        2K 屏上就会糊成一片, 宁可掉帧也要把图铺满。
-        work_ms 是"纯干活时间"(不含 tick 的等待), 见 run()。
+        v1.03~v1.04 这里的"自适应降帧/缩画面"已全部删掉 —— 那套逻辑的代价
+        远大于收益: 降帧并不会让每帧变快, 只是把卡顿藏起来; 缩画面更是直接
+        把 2K 屏糊成一片。现在帧率固定 60、画面固定铺满, 不够快就去优化
+        每帧本身的工作量(见 _init_display 的 SCALED)。
         """
-        if not IS_ANDROID:
-            return
-        self._adapt_t += frame_dt
-        if self._adapt_t < 0.8:            # 每 0.8 秒最多调整一次
-            return
-        self._adapt_t = 0.0
-        # 画面倍数锁定 1.0: 任何时候都按"能铺多大铺多大"呈现
+        if self._fps_target != FPS:
+            self._fps_target = FPS
         if self._present_cap != 1.0:
             self._present_cap = 1.0
             self._scaled = None
-        # 60 帧预算 16.7ms / 30 帧预算 33.3ms
-        if self._fps_target >= 60 and work_ms > 14.0:
-            self._fps_target = 30          # 扛不住 60 帧 -> 退回 30 帧, 画面不变
-        elif self._fps_target < 60 and work_ms < 7.0:
-            self._fps_target = 60          # 机器很空 -> 上 60 帧, 动画更顺
 
     def run(self):
         while self.running:
-            dt = min(self.clock.tick(self._fps_target) / 1000.0, 1.0 / 30.0)
+            # dt 必须是"真实经过的时间", 绝不能再截断成 1/30:
+            # 手机只要跑不满 30 帧(比如只有 20 帧 = 50ms/帧), 截断后每帧
+            # 只推进 33ms —— 游戏就整体变成 66% 速度的慢动作,
+            # 表现为"球飞得慢、门将反应慢"。这里上限只用来防止切后台回来
+            # 时一次跳几秒导致穿模, 0.1s 已经足够安全。
+            dt = min(self.clock.tick(self._fps_target) / 1000.0, 0.10)
             # 注意: 计时必须放在 tick() 之后 —— tick 里含"等到下一帧"的等待时间,
-            # 若把它也计进 work, 30帧模式下恒为 33ms, 自适应会误判机器扛不住,
-            # 一路把画面缩到最小档。
+            # 若把它也计进 work, 会把等待时间误当成干活时间。
             t0 = time.perf_counter()
             for ev in pygame.event.get():
                 self.handle_event(ev)
