@@ -30,19 +30,18 @@ jobs:
             libssl-dev libltdl-dev
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
 
-      # 缓存 SDK/NDK + 编译产物
-      # key 换新(buildozer-py312-v1): 后续命中会直接复用 SDK/NDK 与 3.12 的 dist
-      # restore-keys 保留旧前缀 buildozer-ndk-: 第一次能复用之前下载好的 SDK/NDK(省 ~15 分钟)
-      # 但旧的 .buildozer 里是 Python 3.14 的 dist, 必须在编译前 rm 掉, 否则 sed 降版本不生效
+      # 缓存 SDK/NDK(只复用 SDK/NDK 的下载, dist 每次强制重建)
+      # key: buildozer-py310-v1 —— 与 buildozer.spec 里 python3==3.10.13 对应。
+      # 换 Python 版本时必须同时换 key, 否则会命中旧版本的 dist 缓存。
       - name: 缓存 Buildozer 全局目录
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-py312-v1
+          key: buildozer-py310-v1
           restore-keys: |
-            buildozer-ndk-
+            buildozer-
 
       - name: 安装 Buildozer
         run: |
@@ -51,13 +50,13 @@ jobs:
 
       # 注意: 不要在这里用 `sed` 改 p4a 的 python3 recipe —— buildozer 是 clone p4a 而不是
       # pip 安装, 该步骤 `import pythonforandroid` 会 ModuleNotFoundError 并让整个 job 失败。
-      # Python 版本统一在 buildozer.spec 的 requirements = python3==3.12.10 里固定。
+      # Python 版本统一在 buildozer.spec 的 requirements = python3==3.10.13 里固定。
 
       - name: "清理旧 dist / 克隆的 p4a(关键: 否则缓存里的 3.14 被复用, == 覆盖不生效)"
         run: |
           rm -rf .buildozer
           rm -rf ~/.buildozer/android/platform/python-for-android
-          echo "已清理 .buildozer 与克隆的 p4a, 将用 Python 3.12 重新构建"
+          echo "已清理 .buildozer 与克隆的 p4a, 将用 Python 3.10.13 重新构建"
 
       - name: 编译 APK(首次约 20-40 分钟, 会自动下载 Android SDK/NDK)
         run: |
