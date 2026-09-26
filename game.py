@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.08"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.09"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -257,10 +257,42 @@ def _shot_speed(frac, attr, fatigue, skill=False):
 # 缓存 Vibrator 句柄: 第一次成功拿到后复用; 取不到则下次重试(不永久禁用,
 # 避免某次初始化时序问题把震动彻底关掉). 仅当 jnius 完全不可用才永久禁用.
 _vibrator = None
+_vibrate_activity = None  # 优先用 Activity 切到主线程(部分机型 getMainLooper 也行)
+
+# jnius 只在安卓打包环境存在, 桌面端 import 会失败 -> 用 try 包住, 失败时留空实现.
+try:
+    from jnius import PythonJavaClass, java_method
+
+    class _VibeRunnable(PythonJavaClass):
+        __javainterfaces__ = ['java/lang/Runnable']
+        __javacontext__ = 'app'
+
+        def __init__(self, fn):
+            super(_VibeRunnable, self).__init__()
+            self._fn = fn
+
+        @java_method('()V')
+        def run(self):
+            try:
+                self._fn()
+            except Exception:
+                pass
+except Exception:
+    # 桌面端(无 jnius): 留空壳, _android_vibrate 会因 IS_ANDROID=False 直接返回.
+    class _VibeRunnable:
+        def __init__(self, fn):
+            self._fn = fn
+
 
 def _android_vibrate(ms):
-    # 手机端震动反馈; 非安卓 / 无权限时静默跳过. 必须在主线程调用.
-    global _vibrator
+    # 手机端震动反馈; 非安卓 / 无权限时静默跳过.
+    # 关键修复(此前完全无震动的根因):
+    #   Android 8.0+(API26) 的 vibrate() 必须在"主线程(Looper)"调用,
+    #   而 pygame/p4a 的游戏循环跑在 SDL 子线程, 没有 Looper -> 抛
+    #   IllegalStateException 被 try 吞掉 -> _vibrator 被置 None 反复重试也永远失败
+    #   -> 用户一点感觉都没有. 这里统一切到主线程再 vibrate.
+    # 触感: 像来电一样的"嗡—嗡—"节奏(强震+短歇波形), 而不是一下短震.
+    global _vibrator, _vibrate_activity
     if not IS_ANDROID:
         return
     if _vibrator is False:
@@ -271,9 +303,11 @@ def _android_vibrate(ms):
             # 尽量拿到 Vibrator: 先试 PythonActivity, 失败再试 Application Context.
             # (实测部分机型/打包方式下 mActivity 取不到, 走 ActivityThread 兜底.)
             ctx = None
+            activity = None
             try:
                 PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                ctx = PythonActivity.mActivity
+                activity = PythonActivity.mActivity
+                ctx = activity
             except Exception:
                 ctx = None
             if ctx is None:
@@ -292,16 +326,73 @@ def _android_vibrate(ms):
                 _vibrator = None
                 return
             _vibrator = vib
+            _vibrate_activity = activity  # Activity 才有 runOnUiThread
+
         vib = _vibrator
-        try:
-            VibrationEffect = autoclass("android.os.VibrationEffect")
-            # 中等强度短震(振幅 200/255, 在多数机型上明显可感)
-            vib.vibrate(VibrationEffect.createOneShot(int(ms), 200))
-        except Exception:
+
+        # 像来电一样的震动: 强震(振幅拉满)+ 短歇 交替的节奏波形.
+        # 短反馈(进球/扑救)给单次强震; 长反馈(超大力进球)铺成多段"嗡—嗡—"节奏.
+        if ms >= 200:
+            on, off = 90, 50            # 单段: 震90ms / 歇50ms
+            seg = on + off
+            n = max(2, int(round(ms / seg)))
+            timings, amps = [], []
+            for i in range(n):
+                timings.append(on)
+                amps.append(255)
+                if i < n - 1:
+                    timings.append(off)
+                    amps.append(0)
+            # 等比缩放, 让总时长≈请求的 ms
+            total = sum(timings)
+            if total and total != ms:
+                s = ms / total
+                timings = [max(30, int(round(t * s))) for t in timings]
+            # 去掉结尾多余静音段, 避免拖长
+            while len(timings) >= 2 and amps[-1] == 0:
+                timings.pop()
+                amps.pop()
+        else:
+            # 短反馈: 单次强震(来电的第一下也是"咚")
+            timings, amps = [int(ms)], [255]
+
+        def do_vibrate():
             try:
-                vib.vibrate(int(ms))
+                VibrationEffect = autoclass("android.os.VibrationEffect")
+                try:
+                    # API26+ 波形(带振幅, 触感清晰、像来电)
+                    effect = VibrationEffect.createWaveform(
+                        [int(t) for t in timings],
+                        [int(a) for a in amps],
+                        -1)            # -1 = 不循环, 按 timings 播完一次
+                    vib.vibrate(effect)
+                except Exception:
+                    # 老系统: 退化成无振幅 pattern(仍然有节奏)
+                    vib.vibrate([int(t) for t in timings], -1)
             except Exception:
-                # 本次调用失败, 允许下次重试
+                pass
+
+        # 切到主线程执行 vibrate(API26+ 否则 IllegalStateException)
+        posted = False
+        if _vibrate_activity is not None and _VibeRunnable is not None:
+            try:
+                _vibrate_activity.runOnUiThread(_VibeRunnable(do_vibrate))
+                posted = True
+            except Exception:
+                posted = False
+        if not posted and _VibeRunnable is not None:
+            try:
+                Handler = autoclass('android.os.Handler')
+                Looper = autoclass('android.os.Looper')
+                Handler(Looper.getMainLooper()).post(_VibeRunnable(do_vibrate))
+                posted = True
+            except Exception:
+                posted = False
+        if not posted:
+            # 实在没有主线程入口, 直接试一次(多数情况能成)
+            try:
+                do_vibrate()
+            except Exception:
                 _vibrator = None
     except Exception:
         # jnius 完全不可用(理论上不会发生, 因为已打进包), 永久禁用避免每次都 import 报错
@@ -796,6 +887,7 @@ class Game:
         self.ball = Ball()
         self.keeper = KeeperState()
         self.striker = StrikerState()
+        self._dive_kp = None  # 本次扑救使用的门将属性(供 ROUND_RESULT 继续推进动画)
 
         # AI 球员属性(在AI回合开始时选定, 整个回合内固定)
         self.ai_striker_profile: Optional[StrikerProfile] = None
@@ -1046,7 +1138,8 @@ class Game:
         # 关键时刻(加时/突然死亡)AI 更敢用技能
         clutch = 0.20 if self.is_overtime else 0.0
         if sk == "power_shot":
-            if self.ai_skill_charge < 60:
+            # v1.09: 使用条件改为 疲劳度 < 50%(内部 0~10, 即 < 5.0)
+            if self.ai_fatigue >= 5.0:
                 return "normal"
             # 落后=拼命搏重炮, 领先=少见血
             p = 0.60 if score_diff < 0 else (0.45 if score_diff == 0 else 0.32)
@@ -1533,7 +1626,8 @@ class Game:
                 if self.selected_skill != "precision":
                     self.curve_cell2 = 0
         elif sp.skill == "power_shot":
-            if self.player_skill_charge >= 60:
+            # v1.09: 超大力射门使用条件改为 疲劳度 < 50%(内部 0~10, 即 < 5.0)
+            if self.player_fatigue < 5.0:
                 self.selected_skill = ("power_shot" if self.selected_skill != "power_shot"
                                         else "normal")
                 if self.selected_skill != "power_shot":
@@ -1699,7 +1793,7 @@ class Game:
                         and self.player_skill_charge >= 80)
         is_power_shot = (self.selected_skill == "power_shot" and
                          sp.skill == "power_shot"
-                         and self.player_skill_charge >= 60)
+                         and self.player_fatigue < 5.0)
 
         if is_precision:
             power = min(power, 0.6)
@@ -1709,7 +1803,8 @@ class Game:
         elif is_power_shot:
             power = 1.3
             # 超大力: 准度控制偏差(accuracy越高偏差越小)
-            noise_amp = (1.0 - sp.accuracy / 10.0) * 0.6
+            # v1.09: 技能生效时略微提高精准度(偏差再降 15%)
+            noise_amp = (1.0 - sp.accuracy / 10.0) * 0.6 * 0.85
             self.player_skill_charge = 0
         else:
             # 普通射门: 准度控制偏差(accuracy越高偏差越小)
@@ -1814,6 +1909,8 @@ class Game:
         self.keeper.diving = False
         self.keeper.dive_dir = -1 if target_x < -0.2 else (1 if target_x > 0.2 else 0)
         self.keeper.dive_high = target_y > 1.0
+        # 记住本次扑救用的门将属性, 供 ROUND_RESULT 阶段继续推进动画(避免换属性导致不一致)
+        self._dive_kp = kp
 
     def _commit_player_defense(self):
         """玩家完成守门 - 设置扑救目标."""
@@ -1847,7 +1944,8 @@ class Game:
         # 准度控制偏差(与玩家一致)
         noise_amp = (1.0 - ai_sp.accuracy / 10.0) * 0.6
         if ai_skill == "power_shot":
-            noise_amp *= 1.2  # 超大力偏差略增
+            # 超大力偏差略增; v1.09: 技能生效时略提精准度, 故从 1.2 降到 1.05
+            noise_amp *= 1.05
         elif ai_skill == "precision":
             noise_amp = 0.12  # 超精准: 偏差暴降至12%
         # 心理: 加时赛准度加成
@@ -1917,6 +2015,17 @@ class Game:
             self._update_ball_fly(dt)
         elif self.state == State.ROUND_RESULT:
             self.result_t += dt
+            # v1.09: 让门将把扑救动作完整做完(平滑落位到所选格子, 不瞬移).
+            # 球速太快被破防时, 此时可能还没到位 —— 也保持连贯继续扑, 最终自然停在所选格.
+            if getattr(self.keeper, "committed", False):
+                kp = getattr(self, "_dive_kp", None)
+                if kp is None:
+                    kp = (self.ai_keeper_profile if self.attacker_is_player
+                          else self.keeper_profile)
+                if kp is None:
+                    kp = (random.choice(KEEPERS) if self.attacker_is_player
+                          else self.keeper_profile)
+                self._update_keeper_dive(dt, kp)
         elif self.state == State.GAME_OVER:
             pass
 
@@ -1998,9 +2107,15 @@ class Game:
         k = self.keeper
         k.jump_x0 = k.x
         tx, ty = k.target_x, k.target_y
-        # 到位时间: 扑救(dive)越高, 横向移动越快
-        #   dive10 -> 0.30s, dive7 -> 0.37s, dive4 -> 0.44s
-        t_reach = 0.54 - 0.024 * kp.dive
+        # 到位时间: 目标越远, 到位越慢; 扑救(dive)越高, 横向移动越快.
+        # 距离相关是关键 —— 扑向两翼/上角(离中下起始位更远)要挪更远,
+        # 快球更容易"来不及到位"被破防(贴合真实足球).
+        #   dive7 + 近距(中下) ~0.28s, dive4 + 远角 ~0.55s
+        horiz = abs(tx - k.jump_x0)
+        vert = abs(ty)
+        dist = math.hypot(horiz, vert)
+        t_reach = 0.30 + 0.085 * dist - 0.018 * kp.dive
+        t_reach = max(0.26, min(0.72, t_reach))
         k.jump_vx = (tx - k.jump_x0) / t_reach if t_reach > 0.05 else 0.0
         # 起跳高度上限(脚离地): dive4 -> 0.73m, dive10 -> 1.15m
         apex_cap = 0.45 + 0.07 * kp.dive
@@ -2073,15 +2188,9 @@ class Game:
         self.save_fail_reason = ""
         self.ball.active = False
         bx, by, bz = self.ball.x, self.ball.y, GOAL_Z
-        # 结算瞬间把守门员"落位"到它承诺扑救的格子: 这样画面上守门员所在位置
-        # 与判定用的格子完全一致, 消除"球在角上、门将却还在中间却判定扑出"的矛盾.
-        # (动画过程仍是扑出动作, 只是定格时对齐到承诺的格子.)
-        if getattr(self.keeper, "committed", False):
-            self.keeper.x = self.keeper.target_x
-            self.keeper.y = self.keeper.target_y
-            self.keeper.diving = True
-            self.keeper.landed = True
-            self.keeper.dive_t = 0.42   # 定格为"已扑到承诺格子"的完整动作姿态
+        # v1.09: 不再"瞬移"对齐到承诺格子. 改为在 ROUND_RESULT 阶段让扑救动画
+        # 平滑推进到所选格子(见 update()), 既"完整连贯"又"停在正确格子", 不瞬移.
+        # 方向判定统一以"承诺的目标格"为准(动画最终会落位到该格, 故与画面一致).
         # 1. 是否在球门内?(用球心判定, 与真实规则一致: 球整体越过门线)
         in_goal = (-GOAL_W / 2 <= bx <= GOAL_W / 2) and (0 <= by <= GOAL_H)
         if not in_goal:
@@ -2112,8 +2221,9 @@ class Game:
 
         # 3. 方向判定 - 精确到格子级
         ball_cell = self._pos_to_cell(bx, by)
-        # 用守门员实际落位(已在结算瞬间对齐到承诺格子)判定, 与画面显示完全一致
-        keeper_cell = self._pos_to_cell(self.keeper.x, self.keeper.y)
+        # 方向判定以"承诺的目标格"为准(动画会平滑落位到该格, 故与画面最终一致)
+        keeper_target_cell = self._pos_to_cell(self.keeper.target_x, self.keeper.target_y)
+        keeper_cell = keeper_target_cell
         dir_correct = (ball_cell == keeper_cell)
         # 相邻格子(臂展覆盖)
         is_adjacent = (not dir_correct and
@@ -2172,7 +2282,13 @@ class Game:
         if dir_correct:
             save_power = (kp.reflex if ball_is_corner else kp.dive) / 10.0
             attr_type = "reflex" if ball_is_corner else "dive"
-            effective_power = save_power * ball_quality
+            # 距离因子: 离中间下方(8号)格子越远, 门将到位越慢, 快球越容易被破防
+            # (贴合真实足球: 中下是门将起始位, 扑向两翼/上角要挪更远)
+            kc_c = CELL_CENTERS[keeper_target_cell]
+            cb_c = CELL_CENTERS[8]
+            dist = math.hypot(kc_c[0] - cb_c[0], kc_c[1] - cb_c[1])
+            dist_factor = max(0.55, 1.0 - dist * 0.10)
+            effective_power = save_power * ball_quality * dist_factor
             if level == "strong" and effective_power < 0.55:
                 base_prob *= 0.16
                 self._break_defense = True
@@ -2225,6 +2341,9 @@ class Game:
         # 也常常差那十几厘米; 打得飘的人落点随机, 平均更靠近门将够得到的区域
         place_factor = 1.0 - (sp_acc - 6) * 0.042   # 准10->0.83, 准6->1.00, 准3->1.13
         base_prob *= power_factor * place_factor
+        # v1.09: 超大力射门技能生效时, 落点更精准刁钻 -> 扑救成功率再降一点点
+        if self._shot_skill == "power_shot":
+            base_prob *= 0.92
 
         # 反应不及
         if not reaction_ok:
@@ -2343,19 +2462,21 @@ class Game:
                 self.match_stats["ai_skill_uses"] += 1
             if is_power:
                 self.match_stats["ai_power_shots"] += 1
-        # 手机端震感反馈(v1.08: 任意进球/扑救都给震动, 超大力进球更强 + 画面轻震)
-        # 之前只在"超大力进球"才震, 实战里极少触发, 用户感知为"完全没震动".
-        if IS_ANDROID:
-            oc = self.last_outcome
-            if oc == "GOAL":
-                if is_power:
-                    self.shake_t = max(self.shake_t, 0.45)
-                    self.shake_amp = max(self.shake_amp, 11)
-                    _android_vibrate(140)
-                else:
-                    _android_vibrate(70)
-            elif oc == "SAVE":
-                _android_vibrate(95)
+        # 两端一致反馈(v1.09): 手机"来电式"震动 + 桌面画面震动.
+        # 震动根因已修复(切主线程), 这里把画面震动移出 IS_ANDROID 守卫, 桌面端也震.
+        oc = self.last_outcome
+        if oc == "GOAL":
+            if is_power:
+                self.shake_t = max(self.shake_t, 0.45)
+                self.shake_amp = max(self.shake_amp, 11)
+                if IS_ANDROID:
+                    _android_vibrate(280)
+            else:
+                if IS_ANDROID:
+                    _android_vibrate(110)
+        elif oc == "SAVE":
+            if IS_ANDROID:
+                _android_vibrate(150)
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
@@ -2381,10 +2502,11 @@ class Game:
         if self.attacker_is_player:
             power = self.power_value
             sp = self.striker_profile
-            is_power_shot = (self.selected_skill == "power_shot" and
-                             sp.skill == "power_shot")
+            # v1.09: 以"实际生效技能"判定(避免疲劳超标时仍误扣 +5.0 疲劳)
+            is_power_shot = (self._shot_skill == "power_shot")
             if is_power_shot:
-                fatigue_change = 8
+                # 超大力使用后 立即 +50% 疲劳(内部 0~10, 即 +5.0)
+                fatigue_change = 5.0
             elif power > 0.7:
                 fatigue_change = 4
             elif power > 0.4:
@@ -2397,7 +2519,11 @@ class Game:
         else:
             ai_sp = self.ai_striker_profile if self.ai_striker_profile else random.choice(STRIKERS)
             ai_power = self.ai_target[2] if self.ai_target else 0.5
-            if ai_power > 0.7:
+            # v1.09: 超大力射门实际生效时, 立即 +50% 疲劳(内部 0~10, 即 +5.0)
+            is_power_shot = (self._shot_skill == "power_shot")
+            if is_power_shot:
+                fatigue_change = 5.0
+            elif ai_power > 0.7:
                 fatigue_change = 4
             elif ai_power > 0.4:
                 fatigue_change = 2
@@ -2649,6 +2775,12 @@ class Game:
                 t = self.font_m.render(text, True, color)
                 screen.blit(t, (WIDTH // 2 - t.get_width() // 2, y))
             y += 30
+        # 底部信息: 开发者 / 版本号(每次发版记得同步修改 VERSION 常量)
+        info_y = HEIGHT - 150
+        dev = self.font_s.render("开发者：只因兔同笼", True, (200, 200, 200))
+        ver = self.font_s.render("版本号：%s" % VERSION, True, (200, 200, 200))
+        screen.blit(dev, (WIDTH // 2 - dev.get_width() // 2, info_y))
+        screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, info_y + 28))
         # 返回按钮
         rect = self._button_rect(WIDTH // 2, HEIGHT - 80, 200, 50)
         hover = self._point_in_rect(self.mouse_pos, rect)
@@ -4043,9 +4175,13 @@ class Game:
                 screen.blit(ls, (rect[0] + rect[2] // 2 - ls.get_width() // 2, dy))
                 dy += 14
             return
-        # 充能阈值
+        # 充能阈值 / 就绪条件
         threshold = 80 if sp.skill == "precision" else 60
-        charged = self.player_skill_charge >= threshold
+        # v1.09: 超大力射门改为"疲劳度 < 50%" 为可用条件(不再看充能)
+        if sp.skill == "power_shot":
+            charged = self.player_fatigue < 5.0
+        else:
+            charged = self.player_skill_charge >= threshold
         if sp.skill == "precision":
             if self.precision_shot_used:
                 self._draw_button(screen, rect, "超精准(已用)", hover=False)
@@ -4061,19 +4197,25 @@ class Game:
             elif charged:
                 self._draw_button(screen, rect, "超大力射门(就绪)", hover=hover)
             else:
-                self._draw_button(screen, rect, "超大力(充能中)", hover=False)
-        # 充能进度条(按钮下方)
+                self._draw_button(screen, rect, "超大力(疲劳过高)", hover=False)
+        # 进度条(按钮下方): 超大力显示"剩余体力", 其余显示充能
         bar_x = rect[0]
         bar_y = rect[1] + rect[3] + 2
         bar_w = rect[2]
         bar_h = 8
         pygame.draw.rect(screen, (30, 40, 35), (bar_x, bar_y, bar_w, bar_h),
                          border_radius=3)
-        fill_w = int(bar_w * self.player_skill_charge / 100)
-        bar_color = GREEN if charged else (GOLD if self.player_skill_charge >= threshold * 0.5 else RED)
+        if sp.skill == "power_shot":
+            fill = max(0.0, min(1.0, (10.0 - self.player_fatigue) / 10.0))
+            fill_w = int(bar_w * fill)
+            bar_color = GREEN if charged else (GOLD if self.player_fatigue < 8.0 else RED)
+            pct = self.font_xs.render("疲劳%d%%" % int(self.player_fatigue * 10), True, WHITE)
+        else:
+            fill_w = int(bar_w * self.player_skill_charge / 100)
+            bar_color = GREEN if charged else (GOLD if self.player_skill_charge >= threshold * 0.5 else RED)
+            pct = self.font_xs.render(f"{int(self.player_skill_charge)}%", True, WHITE)
         pygame.draw.rect(screen, bar_color, (bar_x, bar_y, fill_w, bar_h),
                          border_radius=3)
-        pct = self.font_xs.render(f"{int(self.player_skill_charge)}%", True, WHITE)
         screen.blit(pct, (bar_x + bar_w - pct.get_width() - 4, bar_y - 16))
         desc_lines = self._wrap_text(sp.skill_desc, self.font_xs, bar_w)
         dy = bar_y + bar_h + 4
