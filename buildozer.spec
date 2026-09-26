@@ -12,7 +12,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt
 
 # 版本(与 VERSION.txt 保持一致)
-version = 1.01
+version = 1.02
 
 # 依赖: python3 + pygame-ce
 # 版本锁定(踩坑经验, 重要):
