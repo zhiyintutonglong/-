@@ -63,10 +63,13 @@ jobs:
       - name: 准备固定签名 keystore(支持覆盖安装, 无需先卸载旧版)
         run: |
           set -e
-          if [ ! -f android/debug.keystore ]; then
+          # 注意: 仓库里 buildozer.spec 位于根目录(上传时已去掉 android/ 前缀),
+          #       所以 %(source.dir)s == 仓库根目录, keystore 必须生成在根目录,
+          #       不能用 android/debug.keystore(那个子目录在 CI 上不存在)。
+          if [ ! -f debug.keystore ]; then
             echo "未找到固定 keystore, 用 keytool 生成..."
             keytool -genkeypair -v \
-              -keystore android/debug.keystore \
+              -keystore debug.keystore \
               -alias dqls -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=DQLS, OU=Game, O=DQSL, L=CN, ST=CN, C=CN" \
               -storepass dqls1234 -keypass dqls1234
@@ -89,8 +92,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -f android/debug.keystore ] && ! git ls-files --error-unmatch android/debug.keystore >/dev/null 2>&1; then
-            git add android/debug.keystore
+          if [ -f debug.keystore ] && ! git ls-files --error-unmatch debug.keystore >/dev/null 2>&1; then
+            git add debug.keystore
             git commit -m "chore: 添加固定签名 keystore(支持覆盖安装)"
             git push
           else
