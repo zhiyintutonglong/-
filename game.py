@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.02"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.03"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -592,15 +592,30 @@ class Game:
         # 预渲染缓存(性能关键: 静态图层只画一次, 之后每帧直接 blit)
         self._grass_cache: Optional[pygame.Surface] = None
         self._bg_cache: Optional[pygame.Surface] = None      # 天空渐变 + 云
+        self._scene_cache: Optional[pygame.Surface] = None   # 天空+看台+草地 合成图
         self._stands_cache: Optional[pygame.Surface] = None  # 看台 + 观众
         self._net_cache: Optional[pygame.Surface] = None     # 球网(半透明)
-        self._grid_cache: Optional[pygame.Surface] = None    # 九宫格网格线
+        self._grid_cache: Optional[pygame.Surface] = None    # 九宫格网格线(整屏, 备用)
+        self._grid_small: Optional[pygame.Surface] = None    # 九宫格网格线(只球门一小块)
+        self._grid_rect: Tuple[int, int, int, int] = (0, 0, WIDTH, HEIGHT)
+        self._hl: Optional[pygame.Surface] = None            # 瞄准高亮(只球门一小块)
         self._scaled: Optional[pygame.Surface] = None        # 放大后的画布
         self._scale_dest_ok = True                           # scale() 是否支持目标 surface 参数
         self._overlay: Optional[pygame.Surface] = None       # 复用的全屏遮罩
         self._num_cache = {}                                 # 队号数字(按字号缓存)
         self._effect_font_cache = {}                         # GOAL/SAVE 大字(按字号缓存)
         self._card_cache = {}                                # 球员卡片(按 索引+选中态 缓存)
+
+        # 手机端自适应画质(v1.03): 实测每帧耗时, 自动在
+        #   "帧率 30/60" 与 "画面放大倍数 0.60~1.00" 之间找平衡。
+        # 2K 屏手机上软件缩放的像素量极大, 固定铺满会卡; 自动降一点放大倍数
+        # 就能回到流畅区间, 而机器够快时又会自己升回满屏 + 60 帧。
+        self._frame_ms = 8.0        # 单帧"真实干活时间"的滑动平均(ms)
+        self._present_cap = 1.0     # 放大系数上限(1.0=能铺多大铺多大)
+        self._present_rect = None   # 上一次贴图的区域(用于只清黑边/局部刷新)
+        self._update_ok = True      # display.update(rect) 是否可用(老设备退回 flip)
+        self._fps_target = FPS      # 当前帧率目标
+        self._adapt_t = 0.0         # 上次调整至今的时间
 
         # 游戏状态
         self.state = State.MENU
@@ -652,10 +667,17 @@ class Game:
         self.ai_skill_charge = 0
         # 充能阈值: precision需80, power_shot需60
         self.precision_shot_used = False
+        self.ai_precision_used = False      # AI 超精准射门(同样每场1次)
         self.power_shot_active = False
         self.selected_skill = "normal"
         self.curve_cell2 = 0
         self.save_fail_reason = ""
+        # AI 本回合选用的进攻技能: normal / power_shot / precision / curve
+        self.ai_selected_skill = "normal"
+        self.ai_curve_cell2 = 0          # AI 弧线球第二落点
+        self.ai_curve_dir = 1.0          # AI 弧线球侧旋方向(+1=向右弯)
+        # 本次射门"实际生效"的技能(射门瞬间写入, 结算时统计用)
+        self._shot_skill = "normal"
 
         # AI 学习系统 - 记录玩家射门/扑救历史, 用于AI策略优化
         self.player_shot_history: List[int] = []  # 玩家射门选格历史(1-9)
@@ -727,8 +749,11 @@ class Game:
         self.player_skill_charge = 0
         self.ai_skill_charge = 0
         self.precision_shot_used = False
+        self.ai_precision_used = False
         self.power_shot_active = False
         self.selected_skill = "normal"
+        self.ai_selected_skill = "normal"
+        self._shot_skill = "normal"
         self.curve_cell2 = 0
         self.save_fail_reason = ""
         self.player_shot_history.clear()
@@ -771,6 +796,8 @@ class Game:
 
     def _setup_shot(self, player_attacker: bool):
         self.attacker_is_player = player_attacker
+        self._shot_skill = "normal"      # 每次射门前重置(结算时读取实际生效技能)
+        self.ai_selected_skill = "normal"
         self.ball = Ball()
         self.keeper = KeeperState()
         self.keeper.x = 0.0
@@ -834,13 +861,62 @@ class Game:
         max_safe_power = (0.55 + 0.04 * acc + power_bias) * fatigue_factor
         power = random.uniform(0.5, max(0.65, min(0.95, max_safe_power)))
 
-        # 5. 技能使用决策
-        if ai_sp.skill == "power_shot" and score_diff < 0 and random.random() < 0.35:
-            power = 1.3  # 落后时35%概率超大力
-        elif ai_sp.skill == "precision" and random.random() < 0.25:
-            power = min(power, 0.55)  # 25%概率超精准
+        # 5. 技能使用决策(加强版: 三种进攻技能都会用, 并按比分形势调整概率)
+        self.ai_selected_skill = self._ai_pick_skill(ai_sp, score_diff)
+        if self.ai_selected_skill == "power_shot":
+            power = 1.3                       # 超大力射门
+        elif self.ai_selected_skill == "precision":
+            power = min(power, 0.6)           # 超精准射门: 力度上限60%
+        elif self.ai_selected_skill == "curve":
+            # 弧线球: 再选一个格子作第二落点, 真实落点在两格之间(与玩家一致)
+            c2 = self._ai_pick_curve_cell2(cell)
+            self.ai_curve_cell2 = c2
+            tx2, ty2 = CELL_CENTERS[c2]
+            mix = random.uniform(0.3, 0.7)
+            tx = tx * mix + tx2 * (1 - mix)
+            ty = ty * mix + ty2 * (1 - mix)
+            # 侧旋方向: 由第一目标指向第二目标(决定球往哪边弯)
+            self.ai_curve_dir = 1.0 if (tx2 - CELL_CENTERS[cell][0]) > 0 else -1.0
 
         self.ai_target = (tx, ty, power)
+
+    def _ai_pick_skill(self, ai_sp, score_diff: int) -> str:
+        """AI 进攻技能决策 - 按射手技能 + 充能 + 比分形势决定使用哪种技能.
+
+        返回 "normal" / "power_shot" / "precision" / "curve".
+        超大力需充能60, 超精准需充能80且每场1次, 弧线球无限使用(与玩家一致).
+        """
+        sk = getattr(ai_sp, "skill", "none")
+        if sk in (None, "", "none"):
+            return "normal"
+        # 关键时刻(加时/突然死亡)AI 更敢用技能
+        clutch = 0.20 if self.is_overtime else 0.0
+        if sk == "power_shot":
+            if self.ai_skill_charge < 60:
+                return "normal"
+            # 落后=拼命搏重炮, 领先=少见血
+            p = 0.60 if score_diff < 0 else (0.45 if score_diff == 0 else 0.32)
+            return "power_shot" if random.random() < min(0.85, p + clutch) else "normal"
+        if sk == "precision":
+            if self.ai_precision_used or self.ai_skill_charge < 80:
+                return "normal"
+            # 领先/平局时更倾向用精准稳住(打死角)
+            p = 0.50 if score_diff >= 0 else 0.30
+            return "precision" if random.random() < min(0.80, p + clutch) else "normal"
+        if sk == "curve":
+            # 弧线球无限使用, AI 使用率很高(这是它的立身之本)
+            p = 0.72 if abs(score_diff) >= 1 else 0.58
+            return "curve" if random.random() < min(0.90, p + clutch) else "normal"
+        return "normal"
+
+    def _ai_pick_curve_cell2(self, cell: int) -> int:
+        """AI 弧线球第二落点: 优先选同一行相邻的格子(弧线更明显)."""
+        row = (cell - 1) // 3          # 0=上, 1=中, 2=下
+        candidates = [row * 3 + 1, row * 3 + 2, row * 3 + 3]
+        candidates = [c for c in candidates if c != cell and 1 <= c <= 9]
+        if not candidates:
+            candidates = [c for c in range(1, 10) if c != cell]
+        return random.choice(candidates)
 
     def _ai_decide_dive(self):
         """AI 决定扑救方向 - 学习玩家射门模式."""
@@ -1488,6 +1564,15 @@ class Game:
         else:
             # 普通射门: 准度控制偏差(accuracy越高偏差越小)
             noise_amp = (1.0 - sp.accuracy / 10.0) * 0.6
+        # 记录本次射门"实际生效"的技能(赛后统计只认真正生效的, 不被按钮状态误导)
+        if is_power_shot:
+            self._shot_skill = "power_shot"
+        elif is_precision:
+            self._shot_skill = "precision"
+        elif is_curve:
+            self._shot_skill = "curve"
+        else:
+            self._shot_skill = "normal"
         # 心理(composure): 加时赛准度加成
         if self.is_overtime:
             ot_bonus = sp.composure / 10.0 * 0.15  # composure10->偏差减15%
@@ -1602,15 +1687,22 @@ class Game:
         # 疲劳: 力度上限降低
         fatigue_power_cap = 1.0 - self.ai_fatigue * 0.08
         power = min(power, max(0.25, fatigue_power_cap))
-        # AI 技能使用
-        ai_use_skill = False
-        if ai_sp.skill == "power_shot" and random.random() < 0.3:
-            power = 1.3
-            ai_use_skill = True
+        # AI 技能生效(决策阶段已选定, 这里只负责生效 + 扣充能)
+        ai_skill = getattr(self, "ai_selected_skill", "normal")
+        ai_use_skill = ai_skill != "normal"
+        if ai_skill == "power_shot":
+            power = 1.3                       # 超大力射门(不受疲劳力度上限压制)
+            self.ai_skill_charge = 0
+        elif ai_skill == "precision":
+            power = min(power, 0.6)           # 超精准射门
+            self.ai_skill_charge = 0
+            self.ai_precision_used = True
         # 准度控制偏差(与玩家一致)
         noise_amp = (1.0 - ai_sp.accuracy / 10.0) * 0.6
-        if ai_use_skill:
+        if ai_skill == "power_shot":
             noise_amp *= 1.2  # 超大力偏差略增
+        elif ai_skill == "precision":
+            noise_amp = 0.12  # 超精准: 偏差暴降至12%
         # 心理: 加时赛准度加成
         if self.is_overtime:
             ot_bonus = ai_sp.composure / 10.0 * 0.15
@@ -1631,14 +1723,16 @@ class Game:
         # 球速 - 力量决定上限(与玩家一致)
         speed = 12 + ai_sp.power * 1.3 + min(1.0, power) * 5.0
         speed *= (1.0 - self.ai_fatigue * 0.02)
-        if ai_use_skill:
+        if ai_skill == "power_shot":
             speed *= 1.3    # 超大力射门加成
         # AI 弧线球同样用真实侧旋(马格努斯力), 搓球同样损失球速
-        if ai_sp.skill == "curve" and ai_use_skill:
+        if ai_skill == "curve":
             speed *= 0.88
-            spin_rate = random.choice([-1.0, 1.0]) * (118 + ai_sp.power * 3.6)
+            spin_rate = self.ai_curve_dir * (118 + ai_sp.power * 3.6)
         else:
             spin_rate = random.uniform(-9.0, 9.0)
+        # 记录本次射门实际生效的技能(供赛后统计)
+        self._shot_skill = ai_skill
         self._launch_ball(actual_tx, actual_ty, speed, spin_rate)
         self.ball.active = True
         self.ball.trail = []
@@ -2054,24 +2148,34 @@ class Game:
         self.match_stats["total_shots"] += 1
         if self.last_ball_speed > self.match_stats["max_ball_speed"]:
             self.match_stats["max_ball_speed"] = self.last_ball_speed
+        skill_used = self._shot_skill != "normal"
+        is_power = self._shot_skill == "power_shot"
         if self.attacker_is_player:
+            # 玩家射门 -> 结果归玩家; 被扑出 = AI 门将扑救 +1
             self.match_stats["player_shots"] += 1
             if scored:
                 self.match_stats["player_goals"] += 1
             elif self.last_outcome == "MISS":
                 self.match_stats["player_misses"] += 1
-            if self.selected_skill != "normal":
+            else:                              # SAVE
+                self.match_stats["ai_saves"] += 1
+            if skill_used:
                 self.match_stats["player_skill_uses"] += 1
-            if self.selected_skill == "power_shot":
+            if is_power:
                 self.match_stats["player_power_shots"] += 1
         else:
+            # AI 射门 -> 结果归 AI; 被扑出 = 玩家门将扑救 +1
             self.match_stats["ai_shots"] += 1
             if scored:
                 self.match_stats["ai_goals"] += 1
             elif self.last_outcome == "MISS":
                 self.match_stats["ai_misses"] += 1
-        if not self.attacker_is_player and self.last_outcome == "SAVE":
-            self.match_stats["player_saves"] += 1
+            else:                              # SAVE
+                self.match_stats["player_saves"] += 1
+            if skill_used:
+                self.match_stats["ai_skill_uses"] += 1
+            if is_power:
+                self.match_stats["ai_power_shots"] += 1
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
@@ -2236,11 +2340,28 @@ class Game:
         # 安卓上 SDL 偶尔会给出 0 尺寸 surface, 不拦住的话下面会除零/缩放崩溃
         if tw <= 0 or th <= 0:
             return
-        scale = min(tw / WIDTH, th / HEIGHT)
+        # _present_cap: 手机端自适应画质(见 _adapt_quality)
+        # 2K 屏上铺满=每帧软件放大 300 万像素, 卡; 自动收到 0.6~1.0 之间
+        scale = min(tw / WIDTH, th / HEIGHT) * self._present_cap
         if scale <= 0:
             return
         dw, dh = max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))
-        target.fill((0, 0, 0))
+        # 只清黑边: 中间区域马上会被整块覆盖, 没必要每帧全屏 fill 一遍
+        bx, by = (tw - dw) // 2, (th - dh) // 2
+        if self._present_rect != (bx, by, dw, dh):
+            target.fill((0, 0, 0))      # 尺寸变了(自适应画质调档)才整屏清, 防残留
+            self._present_rect = (bx, by, dw, dh)
+        else:
+            top, bottom = by, th - dh - by
+            left, right = bx, tw - dw - bx
+            if top > 0:
+                target.fill((0, 0, 0), (0, 0, tw, top))
+            if bottom > 0:
+                target.fill((0, 0, 0), (0, th - bottom, tw, bottom))
+            if left > 0:
+                target.fill((0, 0, 0), (0, top, left, dh))
+            if right > 0:
+                target.fill((0, 0, 0), (tw - right, top, right, dh))
         if (dw, dh) == (WIDTH, HEIGHT):
             target.blit(canvas, ((tw - dw) // 2, (th - dh) // 2))
             return
@@ -2273,9 +2394,10 @@ class Game:
             return 1.0, 0.0, 0.0
         if tw <= 0 or th <= 0:
             return 1.0, 0.0, 0.0
-        if (tw, th) == (WIDTH, HEIGHT):
+        if (tw, th) == (WIDTH, HEIGHT) and self._present_cap >= 1.0:
             return 1.0, 0.0, 0.0
-        scale = min(tw / WIDTH, th / HEIGHT)
+        # 与 _present() 用同一个放大系数, 否则触摸点会偏移
+        scale = min(tw / WIDTH, th / HEIGHT) * self._present_cap
         if scale <= 0:
             return 1.0, 0.0, 0.0
         dw, dh = WIDTH * scale, HEIGHT * scale
@@ -2596,9 +2718,13 @@ class Game:
         # 天空 + 云朵
         # 静态图层(天空/云/看台/草地)只在第一帧渲染一次, 之后每帧直接贴
         self._ensure_static_layers()
-        screen.blit(self._bg_cache, (0, 0))
-        screen.blit(self._stands_cache, (ox, oy))
-        screen.blit(self._grass_cache, (ox, oy))
+        if (ox == 0 and oy == 0 and self._scene_cache is not None):
+            screen.blit(self._scene_cache, (0, 0))   # 合成图: 一次搞定
+        else:
+            # 震屏时三层要各自偏移, 退回三次 blit
+            screen.blit(self._bg_cache, (0, 0))
+            screen.blit(self._stands_cache, (ox, oy))
+            screen.blit(self._grass_cache, (ox, oy))
         # 球门
         self._draw_goal(screen, ox, oy)
         # 守门员
@@ -2837,6 +2963,14 @@ class Game:
         self._draw_grass(grass, 0, 0)
         self._grass_cache = grass
 
+        # 合成图: 天空+看台+草地三层合成成一张不透明图, 每帧只 blit 一次
+        # (原来三次全屏 blit, 其中两次还是带 alpha 混合的, 在手机上很贵)
+        scene = pygame.Surface((WIDTH, HEIGHT))
+        scene.blit(self._bg_cache, (0, 0))
+        scene.blit(stands, (0, 0))
+        scene.blit(grass, (0, 0))
+        self._scene_cache = scene.convert()
+
         net = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         self._draw_net(net)
         self._net_cache = net
@@ -2844,11 +2978,21 @@ class Game:
         grid = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         self._draw_grid_lines(grid)
         self._grid_cache = grid
+        # 瞄准用的小块: 网格线 + 高亮都只画球门这一块(见 _goal_area_rect)
+        gx, gy, gw, gh = self._goal_area_rect()
+        self._grid_rect = (gx, gy, gw, gh)
+        small = pygame.Surface((gw, gh), pygame.SRCALPHA)
+        self._draw_grid_lines(small, -gx, -gy)
+        self._grid_small = small
+        self._hl = pygame.Surface((gw, gh), pygame.SRCALPHA)
 
         self._overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
-    def _draw_grid_lines(self, surf):
-        """九宫格网格线 —— 静态, 只在构建缓存时调用一次."""
+    def _draw_grid_lines(self, surf, ox=0, oy=0):
+        """九宫格网格线 —— 静态, 只在构建缓存时调用一次.
+
+        ox/oy: 缓存只画球门那一小块, 传入负的包围盒原点做坐标平移。
+        """
         gz = GOAL_Z
         w, h = GOAL_W, GOAL_H
         for i in range(1, 3):
@@ -2857,14 +3001,35 @@ class Game:
             p1 = project(x, 0, gz)
             p2 = project(x, h, gz)
             pygame.draw.line(surf, (255, 255, 255, 80),
-                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 2)
         for i in range(1, 3):
             t = i / 3.0
             y = h * t
             p1 = project(-w / 2, y, gz)
             p2 = project(w / 2, y, gz)
             pygame.draw.line(surf, (255, 255, 255, 80),
-                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 2)
+
+    def _goal_area_rect(self):
+        """球门区域的屏幕包围盒 —— 瞄准网格/高亮都只在这一小块里画。
+
+        原来网格线和高亮都是整屏(1280x800)的 SRCALPHA 贴图, 每帧要白白混合
+        上百万个全透明像素; 球门实际只占画面中间一小块, 缩小后快一个数量级。
+        """
+        gz = GOAL_Z
+        w, h = GOAL_W, GOAL_H
+        pts = [project(-w / 2, 0, gz), project(w / 2, 0, gz),
+               project(-w / 2, h, gz), project(w / 2, h, gz)]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        pad = 18                      # 给高亮描边(3px)+数字留余量
+        x0 = max(0, int(min(xs)) - pad)
+        y0 = max(0, int(min(ys)) - pad)
+        x1 = min(WIDTH, int(max(xs)) + pad + 1)
+        y1 = min(HEIGHT, int(max(ys)) + pad + 1)
+        return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
     def _accept_tap(self, pos):
         """触摸去重.
@@ -3805,9 +3970,15 @@ class Game:
         cells_x = [-w / 2, -w / 6, w / 6, w / 2]
         cells_y = [0, h / 3, 2 * h / 3, h]
         # 半透明覆盖球门区域
-        # 画格子线 —— 静态, 只画一次后缓存(原来每帧新建一块全屏 SRCALPHA)
+        # 画格子线 —— 静态, 只画一次后缓存; 且只占球门那一小块
         self._ensure_static_layers()
-        screen.blit(self._grid_cache, (0, 0))
+        gx, gy = self._grid_rect[0], self._grid_rect[1]
+        small = self._grid_small if self._grid_small is not None else self._grid_cache
+        screen.blit(small, (gx, gy))
+
+        def lp(pt):
+            """屏幕坐标 -> 小块贴图坐标"""
+            return (pt[0] - gx, pt[1] - gy)
 
         # 当前选中的格子 - 高亮
         # 防御: aim_cell 可能因状态切换残留非法值(0/-1), 兜底回中路
@@ -3826,15 +3997,18 @@ class Game:
         p2 = project(x2, y1, gz)
         p3 = project(x2, y2, gz)
         p4 = project(x1, y2, gz)
-        # 高亮
-        hl = self._clear_overlay()
+        # 高亮(也只画球门那一小块, 不再整屏混合)
+        hl = self._hl
+        if hl is None:
+            hl = self._clear_overlay()
+            gx, gy = 0, 0
+        else:
+            hl.fill((0, 0, 0, 0))
         color = (255, 220, 100, 100) if mode == "shoot" else (100, 200, 255, 100)
         pygame.draw.polygon(hl, color,
-                             [(p1[0], p1[1]), (p2[0], p2[1]),
-                              (p3[0], p3[1]), (p4[0], p4[1])])
+                             [lp(p1), lp(p2), lp(p3), lp(p4)])
         pygame.draw.polygon(hl, (255, 255, 255, 200),
-                             [(p1[0], p1[1]), (p2[0], p2[1]),
-                              (p3[0], p3[1]), (p4[0], p4[1])], 3)
+                             [lp(p1), lp(p2), lp(p3), lp(p4)], 3)
 
         # 弧线球: 高亮第二格(紫色)
         if self.curve_cell2 > 0:
@@ -3850,16 +4024,14 @@ class Game:
             q3 = project(x2b, y2b, gz)
             q4 = project(x1b, y2b, gz)
             pygame.draw.polygon(hl, (180, 100, 220, 100),
-                                 [(q1[0], q1[1]), (q2[0], q2[1]),
-                                  (q3[0], q3[1]), (q4[0], q4[1])])
+                                 [lp(q1), lp(q2), lp(q3), lp(q4)])
             pygame.draw.polygon(hl, (220, 180, 255, 200),
-                                 [(q1[0], q1[1]), (q2[0], q2[1]),
-                                  (q3[0], q3[1]), (q4[0], q4[1])], 3)
+                                 [lp(q1), lp(q2), lp(q3), lp(q4)], 3)
             # 弧线连接线
             pmid1 = project(cx, cy, gz)
             pmid2 = project(cx2, cy2, gz)
             pygame.draw.line(hl, (220, 180, 255, 150),
-                             (pmid1[0], pmid1[1]), (pmid2[0], pmid2[1]), 2)
+                             lp(pmid1), lp(pmid2), 2)
 
         # 弧线模式等待第二格: 高亮可选相邻格
         if self.curve_cell2 == -1 and mode == "shoot":
@@ -3875,10 +4047,9 @@ class Game:
                 a3 = project(xb, yb, gz)
                 a4 = project(xa, yb, gz)
                 pygame.draw.polygon(hl, (180, 100, 220, 40),
-                                     [(a1[0], a1[1]), (a2[0], a2[1]),
-                                      (a3[0], a3[1]), (a4[0], a4[1])])
+                                     [lp(a1), lp(a2), lp(a3), lp(a4)])
 
-        screen.blit(hl, (0, 0))
+        screen.blit(hl, (gx, gy))
 
         # 数字标签
         for c in range(1, 10):
@@ -3996,15 +4167,26 @@ class Game:
 
         p_acc = (st["player_goals"] / max(1, st["player_shots"]) * 100)
         a_acc = (st["ai_goals"] / max(1, st["ai_shots"]) * 100)
-        p_save_rate = (st["player_saves"] / max(1, st["ai_shots"]) * 100)
+        # 扑救率 = 扑救数 / 面对射正数(射正 = 进球 + 被扑出, 不含射偏)
+        p_faced = st["player_saves"] + st["ai_goals"]   # 玩家门将面对的射正
+        a_faced = st["ai_saves"] + st["player_goals"]   # AI 门将面对的射正
+        if p_faced > 0:
+            p_save_rate = f"{st['player_saves'] / p_faced * 100:.0f}%"
+        else:
+            p_save_rate = "-"
+        if a_faced > 0:
+            a_save_rate = f"{st['ai_saves'] / a_faced * 100:.0f}%"
+        else:
+            a_save_rate = "-"
         rows = [
             ("", "玩家", "AI", ""),
             ("射门次数", str(st["player_shots"]), str(st["ai_shots"]), ""),
             ("进球数", str(st["player_goals"]), str(st["ai_goals"]), ""),
             ("射偏次数", str(st["player_misses"]), str(st["ai_misses"]), ""),
-            ("扑救次数", str(st["player_saves"]), str(st["ai_saves"] - st["ai_goals"]), ""),
+            ("射正次数(攻)", str(a_faced), str(p_faced), ""),
+            ("扑救次数(守)", str(st["player_saves"]), str(st["ai_saves"]), ""),
             ("射门精度", f"{p_acc:.0f}%", f"{a_acc:.0f}%", ""),
-            ("扑救率", f"{p_save_rate:.0f}%", "-", ""),
+            ("扑救率(守)", p_save_rate, a_save_rate, ""),
             ("技能使用", str(st["player_skill_uses"]), str(st["ai_skill_uses"]), ""),
             ("超大力射门", str(st["player_power_shots"]), str(st["ai_power_shots"]), ""),
             ("最高球速", f"{st['max_ball_speed']:.0f} m/s", "", ""),
@@ -4026,7 +4208,7 @@ class Game:
                 screen.blit(pv, (lx + 200, ry))
                 av = self.font_s.render(row[2], True, WHITE)
                 screen.blit(av, (lx + 290, ry))
-            ry += 36
+            ry += 34
 
         # === 中间: 关键事件回顾 ===
         mx, my = 420, 150
@@ -4122,14 +4304,55 @@ class Game:
     # ----------------------------------------------------------------
     # 主循环
     # ----------------------------------------------------------------
+    def _adapt_quality(self, work_ms: float, frame_dt: float):
+        """手机端自适应画质: 按实测帧耗时在"帧率"和"画面放大倍数"之间自动取舍.
+
+        优先级: 先保画面大小(降帧率), 实在扛不住才缩小画面。
+        每次只做一步 + 有滞回区间, 避免来回抖动。
+        """
+        if not IS_ANDROID:
+            return
+        self._adapt_t += frame_dt
+        if self._adapt_t < 0.8:            # 每 0.8 秒最多调整一次
+            return
+        self._adapt_t = 0.0
+        # 60 帧预算 16.7ms, 30 帧预算 33.3ms
+        if self._fps_target >= 60 and work_ms > 14.0:
+            self._fps_target = 30          # 扛不住 60 帧 -> 退回 30 帧
+        elif work_ms > 24.0 and self._present_cap > 0.60:
+            # 30 帧都快扛不住了 -> 少放大一点(像素量平方级下降)
+            self._present_cap = max(0.60, self._present_cap - 0.08)
+            self._scaled = None
+        elif self._fps_target < 60 and work_ms < 7.0:
+            self._fps_target = 60          # 机器很空 -> 上 60 帧, 动画更顺
+        elif work_ms < 12.0 and self._present_cap < 1.0:
+            self._present_cap = min(1.0, self._present_cap + 0.05)
+            self._scaled = None
+
     def run(self):
         while self.running:
-            dt = min(self.clock.tick(FPS) / 1000.0, 1.0 / 30.0)
+            t0 = time.perf_counter()
+            dt = min(self.clock.tick(self._fps_target) / 1000.0, 1.0 / 30.0)
             for ev in pygame.event.get():
                 self.handle_event(ev)
             self.update(dt)
             self.draw(self.screen)
-            pygame.display.flip()
+            # 只把"真正有画面的那一块"提交给 SDL, 四周常黑的边不重复上传
+            # (手机 2K 屏上每次全屏上传要好几 MB, 只更新中间能省不少)
+            pr = self._present_rect
+            if (self._update_ok and pr is not None
+                    and self.screen.get_size() != (WIDTH, HEIGHT)):
+                try:
+                    pygame.display.update(pr)
+                except Exception:
+                    self._update_ok = False
+                    pygame.display.flip()
+            else:
+                pygame.display.flip()
+            # 只统计"干活时间"(不含 tick 的等待), 才能判断机器是否还有余量
+            work = (time.perf_counter() - t0) * 1000.0
+            self._frame_ms = self._frame_ms * 0.82 + work * 0.18
+            self._adapt_quality(self._frame_ms, dt)
         pygame.quit()
 
 
