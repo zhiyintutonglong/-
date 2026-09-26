@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.03"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.04"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -606,12 +606,16 @@ class Game:
         self._effect_font_cache = {}                         # GOAL/SAVE 大字(按字号缓存)
         self._card_cache = {}                                # 球员卡片(按 索引+选中态 缓存)
 
-        # 手机端自适应画质(v1.03): 实测每帧耗时, 自动在
-        #   "帧率 30/60" 与 "画面放大倍数 0.60~1.00" 之间找平衡。
-        # 2K 屏手机上软件缩放的像素量极大, 固定铺满会卡; 自动降一点放大倍数
-        # 就能回到流畅区间, 而机器够快时又会自己升回满屏 + 60 帧。
+        # 预热: 开局第一帧要现场生成 5 张全屏图(手机上好几十毫秒), 会明显顿一下。
+        # 菜单是空闲状态, 提前十几帧在那里把它们做好, 进比赛时就直接 blit。
+        self._warm_layers = False
+        self._warm_frames = 0
+
+        # 手机端自适应流畅度(v1.04): 只调帧率 60/30, 绝不缩小画面。
+        # (v1.03 的"自适应画质"会一路把画面压到 0.60 —— 2K 屏上又小又糊,
+        #  用户明确要求: 不要压缩画面, 空间无所谓, 甚至可以更大。已改成只降帧。)
         self._frame_ms = 8.0        # 单帧"真实干活时间"的滑动平均(ms)
-        self._present_cap = 1.0     # 放大系数上限(1.0=能铺多大铺多大)
+        self._present_cap = 1.0     # 画面铺满系数, 恒为 1.0(见 _adapt_quality: 只降帧, 不缩画面)
         self._present_rect = None   # 上一次贴图的区域(用于只清黑边/局部刷新)
         self._update_ok = True      # display.update(rect) 是否可用(老设备退回 flip)
         self._fps_target = FPS      # 当前帧率目标
@@ -2340,8 +2344,7 @@ class Game:
         # 安卓上 SDL 偶尔会给出 0 尺寸 surface, 不拦住的话下面会除零/缩放崩溃
         if tw <= 0 or th <= 0:
             return
-        # _present_cap: 手机端自适应画质(见 _adapt_quality)
-        # 2K 屏上铺满=每帧软件放大 300 万像素, 卡; 自动收到 0.6~1.0 之间
+        # _present_cap 恒为 1.0: 屏幕多大就铺多大, 绝不为了省算力把画面压小
         scale = min(tw / WIDTH, th / HEIGHT) * self._present_cap
         if scale <= 0:
             return
@@ -2490,7 +2493,25 @@ class Game:
         hint = self.font_xs.render("Enter=继续   E=结算", True, (160, 160, 160))
         screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2, py + ph - 30))
 
+    def _warmup(self):
+        """在菜单的空闲帧把静态图层提前做好, 避免开局第一帧卡一下.
+
+        这几张全屏图(天空/看台/草地/球网/网格)在手机上要几十毫秒,
+        如果等到"开始比赛"的那一帧才做, 玩家会看到明显的一顿。
+        """
+        if self._warm_layers:
+            return
+        self._warm_frames += 1
+        if self._warm_frames < 12:      # 先让菜单正常显示出来, 别拖慢启动
+            return
+        try:
+            self._ensure_static_layers()
+        except Exception:
+            pass
+        self._warm_layers = True
+
     def _draw_menu(self, screen):
+        self._warmup()
         # 渐变背景
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
         # 草地
@@ -4305,10 +4326,12 @@ class Game:
     # 主循环
     # ----------------------------------------------------------------
     def _adapt_quality(self, work_ms: float, frame_dt: float):
-        """手机端自适应画质: 按实测帧耗时在"帧率"和"画面放大倍数"之间自动取舍.
+        """手机端自适应流畅度: 按实测帧耗时在 60/30 帧之间自动取舍.
 
-        优先级: 先保画面大小(降帧率), 实在扛不住才缩小画面。
-        每次只做一步 + 有滞回区间, 避免来回抖动。
+        重要约定: 只调帧率, 绝不缩小画面。
+        用户明确要求"不要压缩, 空间无所谓" —— 画面一旦缩小,
+        2K 屏上就会糊成一片, 宁可掉帧也要把图铺满。
+        work_ms 是"纯干活时间"(不含 tick 的等待), 见 run()。
         """
         if not IS_ANDROID:
             return
@@ -4316,23 +4339,23 @@ class Game:
         if self._adapt_t < 0.8:            # 每 0.8 秒最多调整一次
             return
         self._adapt_t = 0.0
-        # 60 帧预算 16.7ms, 30 帧预算 33.3ms
-        if self._fps_target >= 60 and work_ms > 14.0:
-            self._fps_target = 30          # 扛不住 60 帧 -> 退回 30 帧
-        elif work_ms > 24.0 and self._present_cap > 0.60:
-            # 30 帧都快扛不住了 -> 少放大一点(像素量平方级下降)
-            self._present_cap = max(0.60, self._present_cap - 0.08)
+        # 画面倍数锁定 1.0: 任何时候都按"能铺多大铺多大"呈现
+        if self._present_cap != 1.0:
+            self._present_cap = 1.0
             self._scaled = None
+        # 60 帧预算 16.7ms / 30 帧预算 33.3ms
+        if self._fps_target >= 60 and work_ms > 14.0:
+            self._fps_target = 30          # 扛不住 60 帧 -> 退回 30 帧, 画面不变
         elif self._fps_target < 60 and work_ms < 7.0:
             self._fps_target = 60          # 机器很空 -> 上 60 帧, 动画更顺
-        elif work_ms < 12.0 and self._present_cap < 1.0:
-            self._present_cap = min(1.0, self._present_cap + 0.05)
-            self._scaled = None
 
     def run(self):
         while self.running:
-            t0 = time.perf_counter()
             dt = min(self.clock.tick(self._fps_target) / 1000.0, 1.0 / 30.0)
+            # 注意: 计时必须放在 tick() 之后 —— tick 里含"等到下一帧"的等待时间,
+            # 若把它也计进 work, 30帧模式下恒为 33ms, 自适应会误判机器扛不住,
+            # 一路把画面缩到最小档。
+            t0 = time.perf_counter()
             for ev in pygame.event.get():
                 self.handle_event(ev)
             self.update(dt)
