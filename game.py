@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.11"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.12"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -286,6 +286,7 @@ _VIB = {
     "has": "-",     # Vibrator.hasVibrator()
     "post": "-",    # 投递到哪个线程执行的
     "method": "-",  # 最后一次实际生效的调用方式
+    "tries": "-",   # 本次尝试的所有路径(诊断用)
     "calls": 0,     # 已请求震动次数
     "ok": 0,        # 实际调用成功次数
     "skip": 0,      # 因规则(普通进球/普通扑救不震)主动跳过次数
@@ -485,55 +486,90 @@ def _android_vibrate(ms):
         def do_vibrate():
             # 注意 global: 全部失败时要把缓存的 Vibrator 丢掉, 让下一次重新取
             global _vibrator
-            VibrationEffect = None
+            # 记录本轮尝试的所有路径(既是诊断信息, 也确保"成功"不是误报)
+            tried = []
+            # 0) 记录 vib 是什么 Java 类 —— 帮助判断我们拿到的到底是 Vibrator 还是别的
+            try:
+                tried.append("cls=%s" % vib.getClass().getName())
+            except Exception:
+                pass
             try:
                 VibrationEffect = autoclass("android.os.VibrationEffect")
             except Exception:
                 VibrationEffect = None
             fails = []
-            # 1) 带振幅的节奏波形(来电式, API26+)
+
+            def _mark(how):
+                _VIB["ok"] = _VIB.get("ok", 0) + 1
+                _VIB["method"] = how
+                _VIB["err"] = "-"
+                tried.append(how)
+
+            def try_call(how, fn):
+                try:
+                    fn()
+                    _mark(how)
+                    return True
+                except Exception as e:
+                    tried.append("!" + how)
+                    fails.append("%s:%s" % (how, e))
+                    return False
+
+            # 准备通知通道 AudioAttributes —— 用户反馈"来消息通知都会震",
+            # 说明通知通路在系统层是放行的. 直接主动震可能被静默拦截.
+            attrs = None
+            try:
+                Bld = autoclass('android.media.AudioAttributes$Builder')
+                b = Bld()
+                b.setUsage(5)   # USAGE_NOTIFICATION = 5
+                attrs = b.build()
+            except Exception as e:
+                tried.append("attrs:%s" % e)
+
+            # 现在六路顺序尝试. 不再"第一个成功就 return" —— 因为之前被认为是"成功"的
+            # 调用其实并没驱动马达, 返回后用户根本没感到. 通知通路 + 显式空对象检查是关键.
             if VibrationEffect is not None:
+                # 1) vibrate(VibrationEffect, AudioAttributes): 单次强震走通知属性
+                if attrs is not None:
+                    eff = None
+                    try:
+                        eff = VibrationEffect.createOneShot(int(ms), 255)
+                    except Exception as e:
+                        tried.append("mk1s:%s" % e)
+                    if eff is not None:
+                        if try_call("vib(1s+@notif)", lambda: vib.vibrate(eff, attrs)):
+                            _VIB["tries"] = "|".join(tried)
+                            return
+                # 2) 带振幅波形(不挂通知属性)
+                eff = None
                 try:
                     eff = VibrationEffect.createWaveform(timings, amps, -1)
-                    vib.vibrate(eff)
-                    _ok("createWaveform+振幅")
-                    return
                 except Exception as e:
-                    fails.append("波形:%s" % e)
-                # 2) 单次强震(最通用, 几乎所有机型都支持, API26+)
-                try:
-                    eff = VibrationEffect.createOneShot(int(ms), 255)
-                    vib.vibrate(eff)
-                    _ok("createOneShot")
+                    tried.append("mkwave:%s" % e)
+                if eff is not None:
+                    if try_call("vib(wave+amp)", lambda: vib.vibrate(eff)):
+                        _VIB["tries"] = "|".join(tried)
+                        return
+                    # 3) 同时挂通知属性再试一次
+                    if attrs is not None and try_call("vib(wave+@notif)",
+                                                       lambda: vib.vibrate(eff, attrs)):
+                        _VIB["tries"] = "|".join(tried)
+                        return
+
+            # 4) 老接口 vibrate(long, AudioAttributes) API21+
+            if attrs is not None:
+                if try_call("vibrate(ms+attr)", lambda: vib.vibrate(int(ms), attrs)):
+                    _VIB["tries"] = "|".join(tried)
                     return
-                except Exception as e:
-                    fails.append("单震:%s" % e)
-                # 3) 无振幅波形
-                try:
-                    eff = VibrationEffect.createWaveform(timings, -1)
-                    vib.vibrate(eff)
-                    _ok("createWaveform")
-                    return
-                except Exception as e:
-                    fails.append("旧波形:%s" % e)
-            # 4) 老接口: pattern + repeat
-            try:
-                vib.vibrate([int(t) for t in timings], -1)
-                _ok("vibrate(pattern)")
-                return
-            except Exception as e:
-                fails.append("pattern:%s" % e)
-            # 5) 老接口: 单次毫秒数
-            try:
-                vib.vibrate(int(ms))
-                _ok("vibrate(ms)")
-                return
-            except Exception as e:
-                fails.append("ms:%s" % e)
-            # 全都失败: 丢弃缓存, 下次重新取服务再试
-            global _vibrator
-            _vibrator = None
-            _vib_err(" | ".join(fails))
+
+            # 5) 老接口 vibrate(long ms)
+            try_call("vibrate(ms)", lambda: vib.vibrate(int(ms)))
+            # 如果连老接口都"成功"了仍然没动作, 全部丢弃缓存下次重来
+            if not _VIB.get("ok", 0):
+                _vibrator = None
+                _vib_err(" | ".join(fails) or "全空对象")
+            else:
+                _VIB["tries"] = "|".join(tried)
 
         # 切到主线程执行 vibrate(API26+ 否则 IllegalStateException)
         posted = False
@@ -580,17 +616,19 @@ def vib_status_lines():
     if not IS_ANDROID:
         return [("桌面版无马达: 这里只能看 status, 请在手机上测试", (180, 180, 180))]
     v = _VIB
-    line1 = "服务=%s  API=%s  有马达=%s" % (v.get("svc", "-"),
-                                          v.get("api", "-"),
-                                          v.get("has", "-"))
-    line2 = "请求%s次 成功%s次 规则跳过%s次 线程=%s 方式=%s" % (
+    line1 = "服务=%s API=%s 有马达=%s" % (v.get("svc", "-"),
+                                       v.get("api", "-"),
+                                       v.get("has", "-"))
+    line2 = "请求%s 成功%s 跳过%s 线程=%s" % (
         v.get("calls", 0), v.get("ok", 0), v.get("skip", 0),
-        v.get("post", "-"), v.get("method", "-"))
-    lines = [(line1, (200, 200, 200)), (line2, (200, 200, 200))]
+        v.get("post", "-"))
+    line3 = "方式=%s 路径=%s" % (v.get("method", "-"),
+                              v.get("tries", "-")[:42])
+    lines = [(line1, (200, 200, 200)), (line2, (200, 200, 200)),
+             (line3, (190, 220, 255))]
     err = v.get("err", "-")
     if err and err != "-":
-        # 出错时优先显示错误(比"还没测过"的提示有用)
-        lines.append(("错误: %s" % err[:52], (255, 130, 130)))
+        lines.append(("错误: %s" % err[:48], (255, 130, 130)))
     elif v.get("calls", 0) == 0:
         lines.append(("点「测试震动」试一下马达; 静音/勿扰模式部分机型不震",
                       (255, 220, 150)))
@@ -2983,13 +3021,13 @@ class Game:
                 screen.blit(t, (WIDTH // 2 - t.get_width() // 2, y))
             y += 28
         # 底部信息: 开发者 / 版本号(每次发版记得同步修改 VERSION 常量)
-        info_y = HEIGHT - 178
+        info_y = HEIGHT - 200
         dev = self.font_s.render("开发者：只因兔同笼", True, (200, 200, 200))
         ver = self.font_s.render("版本号：%s" % VERSION, True, (200, 200, 200))
         screen.blit(dev, (WIDTH // 2 - dev.get_width() // 2, info_y))
         screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, info_y + 26))
         # 震动自检状态(手机上看这里就知道马达到底调用了没有 / 哪一步失败)
-        for i, (txt, col) in enumerate(vib_status_lines()[:3]):
+        for i, (txt, col) in enumerate(vib_status_lines()[:4]):
             t = self.font_s.render(txt, True, col)
             screen.blit(t, (WIDTH // 2 - t.get_width() // 2, info_y + 44 + i * 21))
         # 底部两个按钮: 测试震动 / 返回菜单
