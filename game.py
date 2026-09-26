@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.10"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.11"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -254,10 +254,43 @@ def _shot_speed(frac, attr, fatigue, skill=False):
         base *= POWER_SHOT_BOOST
     return max(6.0, base)
 
+# ====================================================================
+# 震动反馈(安卓 Vibrator 服务)
+# --------------------------------------------------------------------
+# 目标: 像"来电话"一样明显的马达震动.
+# 之前"怎么都震不起来", 逐个环节堵死:
+#   1) 取不到 Vibrator 服务
+#      -> 现在按多条路径依次尝试: Activity / Application Context, 每种再试
+#         API31+ 的 VibratorManager.getDefaultVibrator()、Context.VIBRATOR_SERVICE、
+#         以及直接写字符串 "vibrator"(个别机型 jnius 读不到静态字段)。
+#   2) Android 8.0+(API26) 起 vibrate() 必须在主线程(Looper)调用
+#      -> SDL 游戏线程无 Looper, 直接调会抛 IllegalStateException;
+#         现在统一 post 到 UI 线程(runOnUiThread -> Handler(getMainLooper) -> 直调)。
+#   3) 部分机型不支持"带振幅的波形", createWaveform 会失败
+#      -> 现在 5 级降级: 带振幅波形 / 单次强震 / 无振幅波形 / 旧 pattern / 旧 ms。
+#   4) 结果不可见, 只能靠猜
+#      -> 每次调用都记录到 _VIB, 在「操作说明」页显示:「测试震动」按钮 + 状态行。
+# ====================================================================
 # 缓存 Vibrator 句柄: 第一次成功拿到后复用; 取不到则下次重试(不永久禁用,
 # 避免某次初始化时序问题把震动彻底关掉). 仅当 jnius 完全不可用才永久禁用.
 _vibrator = None
 _vibrate_activity = None  # 优先用 Activity 切到主线程(部分机型 getMainLooper 也行)
+_vib_disabled = False     # jnius 整个不可用时永久放弃, 避免每帧 import 报错
+_vib_ht = None            # 兜底用的后台 Looper 线程(懒惰创建)
+
+# 震动自检信息(在「操作说明」页可见, 用来定位"到底哪一步失败")
+_VIB = {
+    "ctx": "-",     # Context 来源
+    "svc": "-",     # Vibrator 服务获取方式与结果
+    "api": "-",     # Android API 版本
+    "has": "-",     # Vibrator.hasVibrator()
+    "post": "-",    # 投递到哪个线程执行的
+    "method": "-",  # 最后一次实际生效的调用方式
+    "calls": 0,     # 已请求震动次数
+    "ok": 0,        # 实际调用成功次数
+    "skip": 0,      # 因规则(普通进球/普通扑救不震)主动跳过次数
+    "err": "-",     # 最后一次错误
+}
 
 # jnius 只在安卓打包环境存在, 桌面端 import 会失败 -> 用 try 包住, 失败时留空实现.
 try:
@@ -284,119 +317,284 @@ except Exception:
             self._fn = fn
 
 
-def _android_vibrate(ms):
-    # 手机端震动反馈; 非安卓 / 无权限时静默跳过.
-    # 关键修复(此前完全无震动的根因):
-    #   Android 8.0+(API26) 的 vibrate() 必须在"主线程(Looper)"调用,
-    #   而 pygame/p4a 的游戏循环跑在 SDL 子线程, 没有 Looper -> 抛
-    #   IllegalStateException 被 try 吞掉 -> _vibrator 被置 None 反复重试也永远失败
-    #   -> 用户一点感觉都没有. 这里统一切到主线程再 vibrate.
-    # 触感: 像来电一样的"嗡—嗡—"节奏(强震+短歇波形), 而不是一下短震.
-    global _vibrator, _vibrate_activity
-    if not IS_ANDROID:
-        return
-    if _vibrator is False:
-        return
+def _vib_err(msg):
+    try:
+        _VIB["err"] = str(msg)[:150]
+    except Exception:
+        pass
+
+
+def _vib_from_context(ctx, tag):
+    """在某一个 Context 上尝试取 Vibrator. 返回 (vibrator|None, 说明)."""
     try:
         from jnius import autoclass
-        if _vibrator is None:
-            # 尽量拿到 Vibrator: 先试 PythonActivity, 失败再试 Application Context.
-            # (实测部分机型/打包方式下 mActivity 取不到, 走 ActivityThread 兜底.)
-            ctx = None
-            activity = None
-            try:
-                PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                activity = PythonActivity.mActivity
-                ctx = activity
-            except Exception:
-                ctx = None
-            if ctx is None:
-                try:
-                    ActivityThread = autoclass("android.app.ActivityThread")
-                    ctx = ActivityThread.currentApplication()
-                except Exception:
-                    ctx = None
-            if ctx is None:
-                # 这次没拿到 Context, 下次再试(不永久禁用)
-                _vibrator = None
-                return
-            Context = autoclass("android.content.Context")
-            vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
-            if vib is None:
-                _vibrator = None
-                return
-            _vibrator = vib
-            _vibrate_activity = activity  # Activity 才有 runOnUiThread
+    except Exception as e:
+        return None, "%s: jnius 不可用 %s" % (tag, e)
+    fails = []
+    # 路径 1: API31+ 的 VibratorManager.getDefaultVibrator()
+    try:
+        ContextA = autoclass("android.content.Context")
+        mgr_name = getattr(ContextA, "VIBRATOR_MANAGER_SERVICE", None)
+        if mgr_name:
+            from jnius import cast as _cast
+            VibratorManager = autoclass("android.os.VibratorManager")
+            mgr = ctx.getSystemService(mgr_name)
+            if mgr is not None:
+                mgr = _cast("android.os.VibratorManager", mgr)
+                v = mgr.getDefaultVibrator()
+                if v is not None:
+                    return v, "%s/VibratorManager" % tag
+    except Exception as e:
+        fails.append("mgr:%s" % e)
+    # 路径 2: 经典 Context.VIBRATOR_SERVICE
+    try:
+        ContextA = autoclass("android.content.Context")
+        v = ctx.getSystemService(ContextA.VIBRATOR_SERVICE)
+        if v is not None:
+            return v, "%s/VIBRATOR_SERVICE" % tag
+    except Exception as e:
+        fails.append("svc:%s" % e)
+    # 路径 3: 直接写字符串常量(绕开静态字段反射)
+    try:
+        v = ctx.getSystemService("vibrator")
+        if v is not None:
+            return v, "%s/literal" % tag
+    except Exception as e:
+        fails.append("lit:%s" % e)
+    return None, "%s失败(%s)" % (tag, "|".join(fails) or "返回空")
 
+
+def _vib_acquire():
+    """依次尝试各种 Context 拿到 Vibrator. 返回 (vibrator|None, 说明, activity)."""
+    try:
+        from jnius import autoclass
+    except Exception as e:
+        return None, "jnius 不可用: %s" % e, None
+    activity = None
+    try:
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+    except Exception as e:
+        _vib_err("PythonActivity: %s" % e)
+    # Android API 版本(用于判断是否走 VibratorManager)
+    try:
+        BuildVer = autoclass("android.os.Build$VERSION")
+        _VIB["api"] = str(BuildVer.SDK_INT)
+    except Exception:
+        pass
+    ctxs = []
+    if activity is not None:
+        ctxs.append(("Activity", activity))
+    try:
+        app = autoclass("android.app.ActivityThread").currentApplication()
+        if app is not None:
+            ctxs.append(("Application", app))
+    except Exception:
+        pass
+    reasons = []
+    for tag, ctx in ctxs:
+        v, how = _vib_from_context(ctx, tag)
+        if v is not None:
+            _VIB["ctx"] = how.split("/")[0]
+            return v, how, activity
+        reasons.append(how)
+    return None, "未取到服务(%s)" % (" | ".join(reasons) or "无 Context"), None
+
+
+def _vib_pattern(ms):
+    """生成"来电式"节奏波形: 强震(振幅拉满) + 短歇 交替."""
+    if ms >= 200:
+        on, off = 90, 50            # 单段: 震 90ms / 歇 50ms
+        seg = on + off
+        n = max(2, int(round(ms / seg)))
+        timings, amps = [], []
+        for i in range(n):
+            timings.append(on)
+            amps.append(255)
+            if i < n - 1:
+                timings.append(off)
+                amps.append(0)
+        total = sum(timings)
+        if total and total != ms:
+            s = ms / total
+            timings = [max(30, int(round(t * s))) for t in timings]
+        while len(timings) >= 2 and amps[-1] == 0:
+            timings.pop()
+            amps.pop()
+    else:
+        timings, amps = [int(ms)], [255]
+    return [int(t) for t in timings], [int(a) for a in amps]
+
+
+def _vib_handler_thread():
+    """兜底用的后台 Looper 线程(懒惰创建, 全局只建一次)."""
+    global _vib_ht
+    if _vib_ht is not None:
+        return _vib_ht
+    try:
+        from jnius import autoclass
+        HandlerThread = autoclass("android.os.HandlerThread")
+        ht = HandlerThread("vibe")
+        ht.start()
+        if ht.getLooper() is not None:
+            _vib_ht = ht
+            return ht
+    except Exception as e:
+        _vib_err("HandlerThread创建:%s" % e)
+    return None
+
+
+def _android_vibrate(ms):
+    """安卓马达震动. 成功返回 True, 失败返回 False(并把原因记进 _VIB)."""
+    global _vibrator, _vibrate_activity, _vib_disabled
+    if not IS_ANDROID:
+        return False
+    if _vib_disabled:
+        return False
+    try:
+        ms = int(ms)
+    except Exception:
+        ms = 80
+    if ms <= 0:
+        ms = 80
+    _VIB["calls"] += 1
+    try:
+        from jnius import autoclass
         vib = _vibrator
+        if vib is None:
+            vib, how, act = _vib_acquire()
+            _VIB["svc"] = how
+            if vib is None:
+                _vib_err(how)
+                return False
+            _vibrator = vib
+            if act is not None:
+                _vibrate_activity = act
+            try:
+                _VIB["has"] = str(bool(vib.hasVibrator()))
+            except Exception:
+                _VIB["has"] = "?"
 
-        # 像来电一样的震动: 强震(振幅拉满)+ 短歇 交替的节奏波形.
-        # 短反馈(进球/扑救)给单次强震; 长反馈(超大力进球)铺成多段"嗡—嗡—"节奏.
-        if ms >= 200:
-            on, off = 90, 50            # 单段: 震90ms / 歇50ms
-            seg = on + off
-            n = max(2, int(round(ms / seg)))
-            timings, amps = [], []
-            for i in range(n):
-                timings.append(on)
-                amps.append(255)
-                if i < n - 1:
-                    timings.append(off)
-                    amps.append(0)
-            # 等比缩放, 让总时长≈请求的 ms
-            total = sum(timings)
-            if total and total != ms:
-                s = ms / total
-                timings = [max(30, int(round(t * s))) for t in timings]
-            # 去掉结尾多余静音段, 避免拖长
-            while len(timings) >= 2 and amps[-1] == 0:
-                timings.pop()
-                amps.pop()
-        else:
-            # 短反馈: 单次强震(来电的第一下也是"咚")
-            timings, amps = [int(ms)], [255]
+        timings, amps = _vib_pattern(ms)
+
+        def _ok(how):
+            _VIB["ok"] += 1
+            _VIB["method"] = how
+            _VIB["err"] = "-"
 
         def do_vibrate():
+            # 注意 global: 全部失败时要把缓存的 Vibrator 丢掉, 让下一次重新取
+            global _vibrator
+            VibrationEffect = None
             try:
                 VibrationEffect = autoclass("android.os.VibrationEffect")
-                try:
-                    # API26+ 波形(带振幅, 触感清晰、像来电)
-                    effect = VibrationEffect.createWaveform(
-                        [int(t) for t in timings],
-                        [int(a) for a in amps],
-                        -1)            # -1 = 不循环, 按 timings 播完一次
-                    vib.vibrate(effect)
-                except Exception:
-                    # 老系统: 退化成无振幅 pattern(仍然有节奏)
-                    vib.vibrate([int(t) for t in timings], -1)
             except Exception:
-                pass
+                VibrationEffect = None
+            fails = []
+            # 1) 带振幅的节奏波形(来电式, API26+)
+            if VibrationEffect is not None:
+                try:
+                    eff = VibrationEffect.createWaveform(timings, amps, -1)
+                    vib.vibrate(eff)
+                    _ok("createWaveform+振幅")
+                    return
+                except Exception as e:
+                    fails.append("波形:%s" % e)
+                # 2) 单次强震(最通用, 几乎所有机型都支持, API26+)
+                try:
+                    eff = VibrationEffect.createOneShot(int(ms), 255)
+                    vib.vibrate(eff)
+                    _ok("createOneShot")
+                    return
+                except Exception as e:
+                    fails.append("单震:%s" % e)
+                # 3) 无振幅波形
+                try:
+                    eff = VibrationEffect.createWaveform(timings, -1)
+                    vib.vibrate(eff)
+                    _ok("createWaveform")
+                    return
+                except Exception as e:
+                    fails.append("旧波形:%s" % e)
+            # 4) 老接口: pattern + repeat
+            try:
+                vib.vibrate([int(t) for t in timings], -1)
+                _ok("vibrate(pattern)")
+                return
+            except Exception as e:
+                fails.append("pattern:%s" % e)
+            # 5) 老接口: 单次毫秒数
+            try:
+                vib.vibrate(int(ms))
+                _ok("vibrate(ms)")
+                return
+            except Exception as e:
+                fails.append("ms:%s" % e)
+            # 全都失败: 丢弃缓存, 下次重新取服务再试
+            global _vibrator
+            _vibrator = None
+            _vib_err(" | ".join(fails))
 
         # 切到主线程执行 vibrate(API26+ 否则 IllegalStateException)
         posted = False
-        if _vibrate_activity is not None and _VibeRunnable is not None:
+        if _vibrate_activity is not None:
             try:
                 _vibrate_activity.runOnUiThread(_VibeRunnable(do_vibrate))
                 posted = True
-            except Exception:
-                posted = False
-        if not posted and _VibeRunnable is not None:
+                _VIB["post"] = "runOnUiThread"
+            except Exception as e:
+                _vib_err("runOnUiThread:%s" % e)
+        if not posted:
             try:
                 Handler = autoclass('android.os.Handler')
                 Looper = autoclass('android.os.Looper')
                 Handler(Looper.getMainLooper()).post(_VibeRunnable(do_vibrate))
                 posted = True
-            except Exception:
-                posted = False
+                _VIB["post"] = "Handler(main)"
+            except Exception as e:
+                _vib_err("Handler:%s" % e)
         if not posted:
-            # 实在没有主线程入口, 直接试一次(多数情况能成)
+            # 再兜底: 自建一个带 Looper 的后台线程
             try:
-                do_vibrate()
-            except Exception:
-                _vibrator = None
-    except Exception:
-        # jnius 完全不可用(理论上不会发生, 因为已打进包), 永久禁用避免每次都 import 报错
-        _vibrator = False
+                ht = _vib_handler_thread()
+                if ht is not None:
+                    Handler = autoclass('android.os.Handler')
+                    Handler(ht.getLooper()).post(_VibeRunnable(do_vibrate))
+                    posted = True
+                    _VIB["post"] = "HandlerThread"
+            except Exception as e:
+                _vib_err("HandlerThread:%s" % e)
+        if not posted:
+            # 实在没有 Looper 入口, 直接试一次(多数情况也能成)
+            do_vibrate()
+        return True
+    except Exception as e:
+        # jnius 完全不可用(理论上不会发生, 因为已打进包), 永久禁用避免每次都报错
+        _vib_disabled = True
+        _vib_err("致命:%s" % e)
+        return False
+
+
+def vib_status_lines():
+    """震动自检状态文案(给「操作说明」页显示)."""
+    if not IS_ANDROID:
+        return [("桌面版无马达: 这里只能看 status, 请在手机上测试", (180, 180, 180))]
+    v = _VIB
+    line1 = "服务=%s  API=%s  有马达=%s" % (v.get("svc", "-"),
+                                          v.get("api", "-"),
+                                          v.get("has", "-"))
+    line2 = "请求%s次 成功%s次 规则跳过%s次 线程=%s 方式=%s" % (
+        v.get("calls", 0), v.get("ok", 0), v.get("skip", 0),
+        v.get("post", "-"), v.get("method", "-"))
+    lines = [(line1, (200, 200, 200)), (line2, (200, 200, 200))]
+    err = v.get("err", "-")
+    if err and err != "-":
+        # 出错时优先显示错误(比"还没测过"的提示有用)
+        lines.append(("错误: %s" % err[:64], (255, 130, 130)))
+    elif v.get("calls", 0) == 0:
+        lines.append(("点「测试震动」试一下马达; 静音/勿扰模式部分机型不震",
+                      (255, 220, 150)))
+    return lines
 
 CORNER_CELLS = {1, 3, 7, 9}
 KEY_TO_CELL = {
@@ -1698,9 +1896,12 @@ class Game:
                 self.state = State.MENU
                 self.state_t = 0.0
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            # 点击「测试震动」: 立刻让马达响一下, 并把结果写进自检状态行
+            if IS_ANDROID and self._point_in_rect(ev.pos, self._help_vib_rect()):
+                _android_vibrate(320)
+                return
             # 点击返回按钮
-            rect = self._button_rect(WIDTH // 2, HEIGHT - 80, 200, 50)
-            if self._point_in_rect(ev.pos, rect):
+            if self._point_in_rect(ev.pos, self._help_back_rect()):
                 self.state = State.MENU
                 self.state_t = 0.0
 
@@ -2462,24 +2663,27 @@ class Game:
                 self.match_stats["ai_skill_uses"] += 1
             if is_power:
                 self.match_stats["ai_power_shots"] += 1
-        # 两端一致反馈(v1.10): 手机"来电式"震动 + 桌面画面震动.
-        # 震动根因已修复(切主线程).
-        # 规则(v1.10): 普通进球 / 普通扑救 均不震动;
-        #             超大力进球 -> 280ms 强震(来电式);
-        #             扑出"大力射门"(被扑出球速>=25) -> 110ms.
+        # 两端一致反馈: 手机"来电式"马达震动 + 桌面画面震动.
+        # 规则(用户确认): 普通进球 / 普通扑救 均不震动;
+        #                大力射门进球 -> 280ms 强震(来电式节奏);
+        #                扑出"大力射门"(到达门线速度 >=25) -> 110ms.
+        # 不震动时累加 skip 计数 —— 「操作说明」页能看到"规则跳过 X 次",
+        # 用来区分到底是"马达坏了"还是"按规则本来就不该震".
         oc = self.last_outcome
         if oc == "GOAL":
-            if is_power:                     # 超大力进球: 来电式强震
+            if is_power:                     # 大力进球: 来电式强震
                 self.shake_t = max(self.shake_t, 0.45)
                 self.shake_amp = max(self.shake_amp, 11)
                 if IS_ANDROID:
                     _android_vibrate(280)
-            # 普通进球: 不震动
+            else:                            # 普通进球: 不震动
+                _VIB["skip"] += 1
         elif oc == "SAVE":
             if is_power:                     # 扑出的是大力射门 -> 110ms
                 if IS_ANDROID:
                     _android_vibrate(110)
-            # 普通扑救: 不震动
+            else:                            # 普通扑救: 不震动
+                _VIB["skip"] += 1
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
@@ -2772,22 +2976,42 @@ class Game:
                 ("  5轮平局后进入加时赛(突然死亡)", WHITE),
                 ("  一方已无法追平时, 可选择继续或提前结算", WHITE),
             ]
-        y = 140
+        y = 138
         for text, color in lines:
             if text:
                 t = self.font_m.render(text, True, color)
                 screen.blit(t, (WIDTH // 2 - t.get_width() // 2, y))
-            y += 30
+            y += 28
         # 底部信息: 开发者 / 版本号(每次发版记得同步修改 VERSION 常量)
-        info_y = HEIGHT - 150
+        info_y = HEIGHT - 178
         dev = self.font_s.render("开发者：只因兔同笼", True, (200, 200, 200))
         ver = self.font_s.render("版本号：%s" % VERSION, True, (200, 200, 200))
         screen.blit(dev, (WIDTH // 2 - dev.get_width() // 2, info_y))
-        screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, info_y + 28))
-        # 返回按钮
-        rect = self._button_rect(WIDTH // 2, HEIGHT - 80, 200, 50)
+        screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, info_y + 26))
+        # 震动自检状态(手机上看这里就知道马达到底调用了没有 / 哪一步失败)
+        for i, (txt, col) in enumerate(vib_status_lines()[:3]):
+            t = self.font_s.render(txt, True, col)
+            screen.blit(t, (WIDTH // 2 - t.get_width() // 2, info_y + 44 + i * 21))
+        # 底部两个按钮: 测试震动 / 返回菜单
+        if IS_ANDROID:
+            r = self._help_vib_rect()
+            hv = self._point_in_rect(self.mouse_pos, r)
+            self._draw_button(screen, r, "测试震动", hover=hv, active=(hv))
+            rect = self._help_back_rect()
+        else:
+            rect = self._help_back_rect()
         hover = self._point_in_rect(self.mouse_pos, rect)
         self._draw_button(screen, rect, "返回菜单", hover=hover)
+
+    def _help_vib_rect(self):
+        """「测试震动」按钮矩形(仅安卓可见)."""
+        return self._button_rect(WIDTH // 2 - 130, HEIGHT - 40, 230, 46)
+
+    def _help_back_rect(self):
+        """「返回菜单」按钮矩形(说明页底部)."""
+        if IS_ANDROID:
+            return self._button_rect(WIDTH // 2 + 130, HEIGHT - 40, 230, 46)
+        return self._button_rect(WIDTH // 2, HEIGHT - 40, 220, 46)
 
     def _draw_early_end_popup(self, screen):
         """提前结束弹窗 - 用户选择继续或结算."""
