@@ -22,6 +22,7 @@ import math
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -33,9 +34,15 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.00"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.02"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
+
+# 关键: 关闭 SDL 的"触屏模拟鼠标"事件。
+# 默认情况下 SDL 收到一次触摸会同时投递 FINGERDOWN 和 MOUSEBUTTONDOWN,
+# 导致一次点击被游戏处理两次 —— 表现为"点一下就跳过了选择界面/点不动"。
+# 关掉后只保留手指事件, 由 handle_event 统一处理(另有去重兜底)。
+os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
 
 # 本文件所在目录(打包成 apk 后也是资源根目录)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +51,10 @@ IS_ANDROID = (sys.platform == "android"
               or "ANDROID_ARGUMENT" in os.environ
               or "ANDROID_PRIVATE" in os.environ
               or "ANDROID_APP_PATH" in os.environ)
+# 手机屏幕分辨率很高(如 2K 屏), 每帧软件缩放的像素量是桌面的数倍,
+# 目标帧率降到 30 让帧时间更宽松、更稳(游戏逻辑用 dt, 不掉速)
+if IS_ANDROID:
+    FPS = 30
 # 内置中文字体: 手机(Android)上系统里没有微软雅黑/黑体, 不内嵌的话中文全是方块
 FONT_FALLBACKS = ["microsoftyaheiui", "microsoftyahei", "simhei",
                   "notosanscjk", "wenquanyi", "arial"]
@@ -76,6 +87,43 @@ def make_font(size: int, bold: bool = False):
         return pygame.font.SysFont(FONT_FALLBACKS, size, bold=bold)
     except Exception:
         return pygame.font.Font(None, size)
+
+
+class _CachedFont:
+    """字体渲染结果缓存包装.
+
+    手机上 SDL_ttf 的 render() 很贵(尤其 9.7MB 的中文字体),
+    而游戏里大量文字每帧内容都一样(标题/标签/九宫格数字/提示语)。
+    这里按 (文本, 颜色) 缓存渲染结果, 所有现有 .render() 调用点无需改动。
+    """
+
+    __slots__ = ("_f", "_cache")
+
+    def __init__(self, f):
+        self._f = f
+        self._cache = {}
+
+    def render(self, text, antialias=True, color=(255, 255, 255), background=None):
+        try:
+            key = (text, bool(antialias), tuple(color), tuple(background) if background else None)
+        except Exception:
+            return self._f.render(text, antialias, color, background)
+        s = self._cache.get(key)
+        if s is None:
+            s = self._f.render(text, antialias, color, background)
+            if len(self._cache) > 500:      # 动态文本(比分/球速)多时避免无限增长
+                self._cache.clear()
+            self._cache[key] = s
+        return s
+
+    def size(self, text):
+        return self._f.size(text)
+
+    def get_height(self):
+        return self._f.get_height()
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
 
 # 场景3D坐标(米):
 #   球门线 z = 11, 点球点 z = 2 (距球门9米, 接近真实11米)
@@ -530,18 +578,29 @@ class Game:
             random.seed(SEED)
 
         # 字体(手机端依赖随包的中文字体, 见 make_font)
-        self.font_xl = make_font(64, bold=True)
-        self.font_l = make_font(36, bold=True)
-        self.font_m = make_font(24)
-        self.font_s = make_font(18)
-        self.font_xs = make_font(14)
+        # 用 _CachedFont 包一层: 同样的(文本,颜色)只渲染一次, 之后复用
+        self.font_xl = _CachedFont(make_font(64, bold=True))
+        self.font_l = _CachedFont(make_font(36, bold=True))
+        self.font_m = _CachedFont(make_font(24))
+        self.font_s = _CachedFont(make_font(18))
+        self.font_xs = _CachedFont(make_font(14))
 
         # 自适应画布: 所有绘制都发生在 1280x800 的固定画布上,
         # 再等比缩放贴到真实窗口/手机屏幕(手机端必需, 桌面端 1:1 无影响)
         self._canvas = pygame.Surface((WIDTH, HEIGHT))
 
-        # 预渲染缓存
+        # 预渲染缓存(性能关键: 静态图层只画一次, 之后每帧直接 blit)
         self._grass_cache: Optional[pygame.Surface] = None
+        self._bg_cache: Optional[pygame.Surface] = None      # 天空渐变 + 云
+        self._stands_cache: Optional[pygame.Surface] = None  # 看台 + 观众
+        self._net_cache: Optional[pygame.Surface] = None     # 球网(半透明)
+        self._grid_cache: Optional[pygame.Surface] = None    # 九宫格网格线
+        self._scaled: Optional[pygame.Surface] = None        # 放大后的画布
+        self._scale_dest_ok = True                           # scale() 是否支持目标 surface 参数
+        self._overlay: Optional[pygame.Surface] = None       # 复用的全屏遮罩
+        self._num_cache = {}                                 # 队号数字(按字号缓存)
+        self._effect_font_cache = {}                         # GOAL/SAVE 大字(按字号缓存)
+        self._card_cache = {}                                # 球员卡片(按 索引+选中态 缓存)
 
         # 游戏状态
         self.state = State.MENU
@@ -639,6 +698,9 @@ class Game:
         # 鼠标状态
         self.mouse_pos = (WIDTH // 2, HEIGHT // 2)
         self.mouse_down = False
+        # 触摸去重(见 _accept_tap)
+        self._last_tap_t = -10.0
+        self._last_tap_pos = (-9999.0, -9999.0)
 
     # ----------------------------------------------------------------
     # 属性访问
@@ -959,6 +1021,10 @@ class Game:
             cpos = self._to_canvas_pos((ev.x * tw, ev.y * th))
             already_canvas = True
             if ev.type == getattr(pygame, "FINGERDOWN", -1):
+                # 去重: 若 SDL 的"触屏模拟鼠标"没被完全关掉, 同一次触摸会
+                # 先到 FINGERDOWN 再到 MOUSEBUTTONDOWN。只认第一次。
+                if not self._accept_tap(cpos):
+                    return
                 ev = pygame.event.Event(pygame.MOUSEBUTTONDOWN,
                                         pos=cpos, button=1)
             elif ev.type == getattr(pygame, "FINGERMOTION", -2):
@@ -984,6 +1050,13 @@ class Game:
                         button=ev.button)
             except Exception:
                 pass
+            # 同上: 触摸模拟出来的鼠标按下也要去重, 否则一次点击处理两遍
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                try:
+                    if not self._accept_tap(ev.pos):
+                        return
+                except Exception:
+                    pass
 
         if ev.type == pygame.MOUSEMOTION:
             self.mouse_pos = ev.pos
@@ -1072,10 +1145,15 @@ class Game:
                     break
 
     def _striker_card_rect(self, i):
-        """返回射门球员卡片i的矩形."""
+        """返回射门球员卡片i的矩形.
+
+        注意: 4 张卡必须整体装进 1280 宽的画面里。
+        原来 card_w=320/gap=40 时总宽 1400 > 1280, 首尾两张被推到屏幕外,
+        手机上看着"点了没反应" —— 这里收窄到总宽 1170, 四张都完整可见可点。
+        """
         n = len(STRIKERS)
-        card_w, card_h = 320, 500
-        gap = 40
+        card_w, card_h = 270, 500
+        gap = 30
         total_w = n * card_w + (n - 1) * gap
         start_x = (WIDTH - total_w) // 2
         x = start_x + i * (card_w + gap)
@@ -2145,10 +2223,8 @@ class Game:
 
         # 全局闪光
         if self.goal_flash > 0:
-            flash = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             alpha = int(120 * self.goal_flash)
-            flash.fill((255, 255, 220, alpha))
-            screen.blit(flash, (0, 0))
+            screen.blit(self._dim_overlay(alpha, (255, 255, 220)), (0, 0))
 
         # 画布 -> 真实屏幕(等比缩放 + 居中黑边)
         if screen is not target:
@@ -2167,9 +2243,27 @@ class Game:
         target.fill((0, 0, 0))
         if (dw, dh) == (WIDTH, HEIGHT):
             target.blit(canvas, ((tw - dw) // 2, (th - dh) // 2))
+            return
+        # 性能关键: 手机上每帧都要把画布放大到 2K 级别,
+        #  1) 用 scale 而不是 smoothscale(后者是双线性, 慢一个数量级)
+        #  2) 复用同一块目标 surface, 避免每帧新建/销毁上百万像素的缓冲区
+        if self._scaled is None or self._scaled.get_size() != (dw, dh):
+            try:
+                self._scaled = pygame.Surface((dw, dh), 0, canvas)
+            except Exception:
+                self._scaled = pygame.Surface((dw, dh))
+            self._scaled = self._scaled.convert(canvas)
+        if self._scale_dest_ok:
+            try:
+                # scale(带目标 surface) 可复用缓冲区; 老版本 pygame 不支持该参数,
+                # 首次失败后永久退回两参数版本, 避免每帧抛异常
+                pygame.transform.scale(canvas, (dw, dh), self._scaled)
+            except Exception:
+                self._scale_dest_ok = False
+                self._scaled = pygame.transform.scale(canvas, (dw, dh))
         else:
-            target.blit(pygame.transform.smoothscale(canvas, (dw, dh)),
-                        ((tw - dw) // 2, (th - dh) // 2))
+            self._scaled = pygame.transform.scale(canvas, (dw, dh))
+        target.blit(self._scaled, ((tw - dw) // 2, (th - dh) // 2))
 
     def _scale_factor(self) -> Tuple[float, float, float]:
         """真实屏幕 -> 画布 的缩放与偏移, 供鼠标/触摸坐标反算."""
@@ -2236,9 +2330,7 @@ class Game:
     def _draw_early_end_popup(self, screen):
         """提前结束弹窗 - 用户选择继续或结算."""
         # 半透明遮罩
-        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        s.fill((0, 0, 0, 160))
-        screen.blit(s, (0, 0))
+        screen.blit(self._dim_overlay(160), (0, 0))
         # 弹窗主体
         pw, ph = 560, 280
         px = (WIDTH - pw) // 2
@@ -2343,24 +2435,22 @@ class Game:
         title = self.font_l.render("选择你的射门球员 (1/2)", True, WHITE)
         screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 50))
 
-        n = len(STRIKERS)
-        card_w, card_h = 320, 500
-        gap = 40
-        total_w = n * card_w + (n - 1) * gap
-        start_x = (WIDTH - total_w) // 2
-
+        # 卡片位置统一取自 _striker_card_rect, 保证"画在哪"和"点哪"完全一致
         for i, sp in enumerate(STRIKERS):
-            x = start_x + i * (card_w + gap)
-            y = 130
+            x, y, card_w, card_h = self._striker_card_rect(i)
             sel = (i == self.selected_striker_idx)
-            self._draw_player_card(screen, x, y, card_w, card_h, sp.name,
-                                   [("力量", sp.power), ("准度", sp.accuracy),
-                                    ("心理", sp.composure)],
-                                   sp.color, sp.skin, sp.desc, sel, "射门",
-                                   skill_name=sp.skill_name,
-                                   skill_desc=sp.skill_desc)
+            screen.blit(self._cached_card(
+                ("S", i, sel), card_w, card_h,
+                lambda s, i=i, sp=sp, sel=sel: self._draw_player_card(
+                    s, 0, 0, card_w, card_h, sp.name,
+                    [("力量", sp.power), ("准度", sp.accuracy),
+                     ("心理", sp.composure)],
+                    sp.color, sp.skin, sp.desc, sel, "射门",
+                    skill_name=sp.skill_name,
+                    skill_desc=sp.skill_desc)),
+                (x, y))
 
-        tip = self.font_s.render("鼠标点击卡片 / ← → 切换   Enter/空格/点击 确认", True, HUD_FG)
+        tip = self.font_s.render("点卡片选中并确认   ← → 可切换", True, HUD_FG)
         screen.blit(tip, (WIDTH // 2 - tip.get_width() // 2, HEIGHT - 50))
 
     def _draw_select_keeper(self, screen):
@@ -2369,26 +2459,24 @@ class Game:
         title = self.font_l.render("选择你的守门员 (2/2)", True, WHITE)
         screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 50))
 
-        n = len(KEEPERS)
-        card_w, card_h = 220, 420
-        gap = 18
-        total_w = n * card_w + (n - 1) * gap
-        start_x = (WIDTH - total_w) // 2
-
+        # 卡片位置统一取自 _keeper_card_rect, 保证"画在哪"和"点哪"完全一致
         for i, kp in enumerate(KEEPERS):
-            x = start_x + i * (card_w + gap)
-            y = 150
+            x, y, card_w, card_h = self._keeper_card_rect(i)
             sel = (i == self.selected_keeper_idx)
             # 综合扑救力(用于判断能否挡重力球)
             save_power = (kp.reflex * 0.4 + kp.dive * 0.6) / 10.0
             sp_color = GREEN if save_power >= 0.55 else RED
-            self._draw_player_card(screen, x, y, card_w, card_h, kp.name,
-                                   [("反应", kp.reflex), ("臂展", kp.reach),
-                                    ("扑救", kp.dive)],
-                                   kp.color, kp.skin, kp.desc, sel, "守门",
-                                   small=True,
-                                   skill_name=kp.skill_name,
-                                   skill_desc=kp.skill_desc)
+            screen.blit(self._cached_card(
+                ("K", i, sel), card_w, card_h,
+                lambda s, i=i, kp=kp, sel=sel: self._draw_player_card(
+                    s, 0, 0, card_w, card_h, kp.name,
+                    [("反应", kp.reflex), ("臂展", kp.reach),
+                     ("扑救", kp.dive)],
+                    kp.color, kp.skin, kp.desc, sel, "守门",
+                    small=True,
+                    skill_name=kp.skill_name,
+                    skill_desc=kp.skill_desc)),
+                (x, y))
             # 在卡片底部显示综合扑救力
             sp_label = self.font_xs.render(
                 f"综合扑救力: {save_power:.2f}", True, sp_color)
@@ -2506,12 +2594,11 @@ class Game:
     # ----- 比赛场景 -----
     def _draw_match(self, screen, ox=0, oy=0):
         # 天空 + 云朵
-        self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
-        self._draw_clouds(screen)
-        # 远处看台(在草地之前画, 作为背景)
-        self._draw_stands(screen, ox, oy)
-        # 草地透视
-        self._draw_grass(screen, ox, oy)
+        # 静态图层(天空/云/看台/草地)只在第一帧渲染一次, 之后每帧直接贴
+        self._ensure_static_layers()
+        screen.blit(self._bg_cache, (0, 0))
+        screen.blit(self._stands_cache, (ox, oy))
+        screen.blit(self._grass_cache, (ox, oy))
         # 球门
         self._draw_goal(screen, ox, oy)
         # 守门员
@@ -2550,14 +2637,12 @@ class Game:
         font_size = int(100 * scale)
         if font_size < 10:
             font_size = 10
-        goal_font = pygame.font.SysFont(
-            ["microsoftyaheiui", "microsoftyahei", "arial"], font_size, bold=True)
-        goal_text = goal_font.render("GOAL!", True, GOLD)
+        goal_text = self._big_text("GOAL!", font_size, GOLD)
         # 描边效果
         cx = WIDTH // 2
         cy = HEIGHT // 2 - 40
         for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
-            outline = goal_font.render("GOAL!", True, BLACK)
+            outline = self._big_text("GOAL!", font_size, BLACK)
             screen.blit(outline, (cx - outline.get_width()//2 + dx, cy + dy))
         screen.blit(goal_text, (cx - goal_text.get_width()//2, cy))
         # 球速信息
@@ -2590,13 +2675,11 @@ class Game:
         font_size = int(80 * scale)
         if font_size < 10:
             font_size = 10
-        save_font = pygame.font.SysFont(
-            ["microsoftyaheiui", "microsoftyahei", "arial"], font_size, bold=True)
-        save_text = save_font.render("SAVE!", True, BLUE)
+        save_text = self._big_text("SAVE!", font_size, BLUE)
         cx = WIDTH // 2
         cy = HEIGHT // 2 - 40
         for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
-            outline = save_font.render("SAVE!", True, BLACK)
+            outline = self._big_text("SAVE!", font_size, BLACK)
             screen.blit(outline, (cx - outline.get_width()//2 + dx, cy + dy))
         screen.blit(save_text, (cx - save_text.get_width()//2, cy))
 
@@ -2732,6 +2815,221 @@ class Game:
         if len(proj_pts) >= 2:
             pygame.draw.lines(screen, color, False, proj_pts, width)
 
+    def _ensure_static_layers(self):
+        """静态图层只渲染一次(天空/云/看台/草地/球网), 之后每帧直接 blit.
+
+        这些图层原本每帧重画: 渐变 200 次 fill + 云 70 个椭圆 + 看台 120 个圆
+        + 草地数十条线 + 两块全屏半透明球网 —— 在手机上占了绝大部分帧时间。
+        抖动(shake)改为整体平移贴图, 视觉等价。
+        """
+        if self._bg_cache is not None:
+            return
+        bg = pygame.Surface((WIDTH, HEIGHT))
+        self._draw_gradient_bg(bg, SKY_TOP, SKY_MID)
+        self._draw_clouds(bg)
+        self._bg_cache = bg.convert()
+
+        stands = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self._draw_stands(stands, 0, 0)
+        self._stands_cache = stands
+
+        grass = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self._draw_grass(grass, 0, 0)
+        self._grass_cache = grass
+
+        net = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self._draw_net(net)
+        self._net_cache = net
+
+        grid = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self._draw_grid_lines(grid)
+        self._grid_cache = grid
+
+        self._overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+
+    def _draw_grid_lines(self, surf):
+        """九宫格网格线 —— 静态, 只在构建缓存时调用一次."""
+        gz = GOAL_Z
+        w, h = GOAL_W, GOAL_H
+        for i in range(1, 3):
+            t = i / 3.0
+            x = -w / 2 + w * t
+            p1 = project(x, 0, gz)
+            p2 = project(x, h, gz)
+            pygame.draw.line(surf, (255, 255, 255, 80),
+                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
+        for i in range(1, 3):
+            t = i / 3.0
+            y = h * t
+            p1 = project(-w / 2, y, gz)
+            p2 = project(w / 2, y, gz)
+            pygame.draw.line(surf, (255, 255, 255, 80),
+                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
+
+    def _accept_tap(self, pos):
+        """触摸去重.
+
+        SDL 收到一次触摸时, 默认会同时投递 FINGERDOWN 和"模拟的" MOUSEBUTTONDOWN,
+        于是游戏把同一次点击处理了两遍: 先选中射手并立刻确认 -> 跳到选门将,
+        紧接着第二次事件又在当前界面上生效 —— 表现为"点了没反应/选不了人"。
+
+        这里把 0.35 秒内、位置几乎相同的第二次按下判为重复并丢弃。
+        桌面端两次真实点击间隔一般都大于 0.35 秒, 不受影响。
+        """
+        try:
+            now = time.time()
+            px, py = float(pos[0]), float(pos[1])
+        except Exception:
+            return True
+        lx, ly = self._last_tap_pos
+        if (now - self._last_tap_t < 0.35 and
+                abs(px - lx) < 60 and abs(py - ly) < 60):
+            return False
+        self._last_tap_t = now
+        self._last_tap_pos = (px, py)
+        return True
+
+    def _cached_card(self, key, w, h, draw_fn):
+        """球员卡片缓存: 卡面是静态的(只有"选中/未选中"两态), 只渲染一次."""
+        s = self._card_cache.get(key)
+        if s is None:
+            s = pygame.Surface((w, h), pygame.SRCALPHA)
+            try:
+                draw_fn(s)
+            except Exception:
+                pass
+            if len(self._card_cache) > 40:
+                self._card_cache.clear()
+            self._card_cache[key] = s
+        return s
+
+    def _team_number(self, size):
+        """球员队号"9" —— 按字号缓存(原来每帧 SysFont + render)."""
+        key = max(8, min(160, int(size)))
+        s = self._num_cache.get(key)
+        if s is None:
+            try:
+                f = pygame.font.SysFont(["arial"], key, bold=True)
+            except Exception:
+                f = self.font_s
+            s = f.render("9", True, WHITE)
+            self._num_cache[key] = s
+        return s
+
+    def _big_text(self, text, size, color):
+        """GOAL!/SAVE! 之类的大字 —— 字号量化到 4 的倍数后缓存."""
+        key = (text, max(10, int(size)) // 4 * 4, tuple(color))
+        s = self._effect_font_cache.get(key)
+        if s is None:
+            try:
+                f = pygame.font.SysFont(FONT_FALLBACKS, key[1], bold=True)
+            except Exception:
+                f = self.font_l
+            s = f.render(text, True, color)
+            if len(self._effect_font_cache) > 120:
+                self._effect_font_cache.clear()
+            self._effect_font_cache[key] = s
+        return s
+
+    def _clear_overlay(self):
+        """清空并复用的全屏半透明缓冲(避免每帧新建 1280x800 的 SRCALPHA)."""
+        self._ensure_static_layers()
+        self._overlay.fill((0, 0, 0, 0))
+        return self._overlay
+
+    def _dim_overlay(self, alpha, color=(0, 0, 0)):
+        """全屏压暗遮罩(复用缓冲)."""
+        s = self._clear_overlay()
+        s.fill((color[0], color[1], color[2], max(0, min(255, int(alpha)))))
+        return s
+
+    def _draw_net(self, surf, ox=0, oy=0):
+        """球网(半透明面 + 网格线)—— 只在构建缓存时调用一次."""
+        w, h = GOAL_W, GOAL_H
+        gz = GOAL_Z
+        back_z = gz + NET_DEPTH
+        fl_b = project(-w / 2, 0, gz)
+        fl_t = project(-w / 2, h, gz)
+        fr_b = project(w / 2, 0, gz)
+        fr_t = project(w / 2, h, gz)
+        bl_b = project(-w / 2, 0, back_z)
+        bl_t = project(-w / 2, h, back_z)
+        br_b = project(w / 2, 0, back_z)
+        br_t = project(w / 2, h, back_z)
+        # 球网半透明
+        # 顶网
+        top_pts = [(fl_t[0] + ox, fl_t[1] + oy), (fr_t[0] + ox, fr_t[1] + oy),
+                   (br_t[0] + ox, br_t[1] + oy), (bl_t[0] + ox, bl_t[1] + oy)]
+        pygame.draw.polygon(surf, (250, 250, 255, 80), top_pts)
+        # 后网
+        back_pts = [(bl_t[0] + ox, bl_t[1] + oy), (br_t[0] + ox, br_t[1] + oy),
+                     (br_b[0] + ox, br_b[1] + oy), (bl_b[0] + ox, bl_b[1] + oy)]
+        pygame.draw.polygon(surf, (250, 250, 255, 60), back_pts)
+        # 左侧网
+        left_pts = [(fl_b[0] + ox, fl_b[1] + oy), (fl_t[0] + ox, fl_t[1] + oy),
+                    (bl_t[0] + ox, bl_t[1] + oy), (bl_b[0] + ox, bl_b[1] + oy)]
+        pygame.draw.polygon(surf, (250, 250, 255, 60), left_pts)
+        # 右侧网
+        right_pts = [(fr_b[0] + ox, fr_b[1] + oy), (fr_t[0] + ox, fr_t[1] + oy),
+                     (br_t[0] + ox, br_t[1] + oy), (br_b[0] + ox, br_b[1] + oy)]
+        pygame.draw.polygon(surf, (250, 250, 255, 60), right_pts)
+
+        # 网格线(更精细 - 顶网+后网+侧网)
+        # 顶网 - 纵向
+        for i in range(1, 12):
+            t = i / 12.0
+            x_l = -w / 2 + w * t
+            p1 = project(x_l, h, gz)
+            p2 = project(x_l, h, back_z)
+            pygame.draw.line(surf, (230, 230, 240, 90),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+        # 顶网 - 横向
+        for i in range(1, 5):
+            t = i / 5.0
+            z_t = gz + NET_DEPTH * t
+            p1 = project(-w / 2, h, z_t)
+            p2 = project(w / 2, h, z_t)
+            pygame.draw.line(surf, (230, 230, 240, 90),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+        # 后网 - 纵向
+        for i in range(1, 12):
+            t = i / 12.0
+            x_l = -w / 2 + w * t
+            p1 = project(x_l, 0, back_z)
+            p2 = project(x_l, h, back_z)
+            pygame.draw.line(surf, (225, 225, 235, 70),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+        # 后网 - 横向
+        for i in range(1, 6):
+            t = i / 6.0
+            y_t = h * t
+            p1 = project(-w / 2, y_t, back_z)
+            p2 = project(w / 2, y_t, back_z)
+            pygame.draw.line(surf, (225, 225, 235, 70),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+        # 左侧网
+        for i in range(1, 5):
+            t = i / 5.0
+            y_t = h * t
+            p1 = project(-w / 2, y_t, gz)
+            p2 = project(-w / 2, y_t, back_z)
+            pygame.draw.line(surf, (225, 225, 235, 60),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+        # 右侧网
+        for i in range(1, 5):
+            t = i / 5.0
+            y_t = h * t
+            p1 = project(w / 2, y_t, gz)
+            p2 = project(w / 2, y_t, back_z)
+            pygame.draw.line(surf, (225, 225, 235, 60),
+                             (p1[0] + ox, p1[1] + oy),
+                             (p2[0] + ox, p2[1] + oy), 1)
+
     def _draw_goal(self, screen, ox=0, oy=0):
         # 球门 + 球网
         w, h = GOAL_W, GOAL_H
@@ -2749,83 +3047,10 @@ class Game:
         br_b = project(w / 2, 0, back_z)
         br_t = project(w / 2, h, back_z)
 
-        # 球网半透明
-        net_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        # 顶网
-        top_pts = [(fl_t[0] + ox, fl_t[1] + oy), (fr_t[0] + ox, fr_t[1] + oy),
-                   (br_t[0] + ox, br_t[1] + oy), (bl_t[0] + ox, bl_t[1] + oy)]
-        pygame.draw.polygon(net_surf, (250, 250, 255, 80), top_pts)
-        # 后网
-        back_pts = [(bl_t[0] + ox, bl_t[1] + oy), (br_t[0] + ox, br_t[1] + oy),
-                     (br_b[0] + ox, br_b[1] + oy), (bl_b[0] + ox, bl_b[1] + oy)]
-        pygame.draw.polygon(net_surf, (250, 250, 255, 60), back_pts)
-        # 左侧网
-        left_pts = [(fl_b[0] + ox, fl_b[1] + oy), (fl_t[0] + ox, fl_t[1] + oy),
-                    (bl_t[0] + ox, bl_t[1] + oy), (bl_b[0] + ox, bl_b[1] + oy)]
-        pygame.draw.polygon(net_surf, (250, 250, 255, 60), left_pts)
-        # 右侧网
-        right_pts = [(fr_b[0] + ox, fr_b[1] + oy), (fr_t[0] + ox, fr_t[1] + oy),
-                     (br_t[0] + ox, br_t[1] + oy), (br_b[0] + ox, br_b[1] + oy)]
-        pygame.draw.polygon(net_surf, (250, 250, 255, 60), right_pts)
-        screen.blit(net_surf, (0, 0))
-
-        # 网格线(更精细 - 顶网+后网+侧网)
-        net_lines = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        # 顶网 - 纵向
-        for i in range(1, 12):
-            t = i / 12.0
-            x_l = -w / 2 + w * t
-            p1 = project(x_l, h, gz)
-            p2 = project(x_l, h, back_z)
-            pygame.draw.line(net_lines, (230, 230, 240, 90),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        # 顶网 - 横向
-        for i in range(1, 5):
-            t = i / 5.0
-            z_t = gz + NET_DEPTH * t
-            p1 = project(-w / 2, h, z_t)
-            p2 = project(w / 2, h, z_t)
-            pygame.draw.line(net_lines, (230, 230, 240, 90),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        # 后网 - 纵向
-        for i in range(1, 12):
-            t = i / 12.0
-            x_l = -w / 2 + w * t
-            p1 = project(x_l, 0, back_z)
-            p2 = project(x_l, h, back_z)
-            pygame.draw.line(net_lines, (225, 225, 235, 70),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        # 后网 - 横向
-        for i in range(1, 6):
-            t = i / 6.0
-            y_t = h * t
-            p1 = project(-w / 2, y_t, back_z)
-            p2 = project(w / 2, y_t, back_z)
-            pygame.draw.line(net_lines, (225, 225, 235, 70),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        # 左侧网
-        for i in range(1, 5):
-            t = i / 5.0
-            y_t = h * t
-            p1 = project(-w / 2, y_t, gz)
-            p2 = project(-w / 2, y_t, back_z)
-            pygame.draw.line(net_lines, (225, 225, 235, 60),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        # 右侧网
-        for i in range(1, 5):
-            t = i / 5.0
-            y_t = h * t
-            p1 = project(w / 2, y_t, gz)
-            p2 = project(w / 2, y_t, back_z)
-            pygame.draw.line(net_lines, (225, 225, 235, 60),
-                             (p1[0] + ox, p1[1] + oy),
-                             (p2[0] + ox, p2[1] + oy), 1)
-        screen.blit(net_lines, (0, 0))
+        # 球网: 静态图层, 只构建一次后每帧直接贴
+        # (原来每帧新建两块 1280x800 的 SRCALPHA surface, 是最大的性能瓶颈之一)
+        self._ensure_static_layers()
+        screen.blit(self._net_cache, (ox, oy))
 
         # 立柱(白) - 带阴影
         post_w = max(3, int(0.12 * fl_b[2]))
@@ -2897,8 +3122,8 @@ class Game:
             for tx, ty, tz in trail_pts:
                 sx, sy, sc = project(tx, ty, tz)
                 pts_2d.append((sx + ox, sy + oy, sc))
-            # 画渐变轨迹线(黄白色)
-            trail_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            # 画渐变轨迹线(黄白色) —— 复用全屏缓冲, 不再每帧新建
+            trail_surf = self._clear_overlay()
             for i in range(len(pts_2d) - 1):
                 t = (i + 1) / len(pts_2d)
                 alpha = int(220 * t)
@@ -3132,9 +3357,8 @@ class Game:
             (cx_i - waist_w / 2, by + body_h),
         ]
         pygame.draw.polygon(screen, light_c, light_pts)
-        # 队号
-        num_font = pygame.font.SysFont(["arial"], max(8, int(body_w * 0.35)), bold=True)
-        num = num_font.render("9", True, WHITE)
+        # 队号(原来每帧 SysFont + render, 很贵 -> 按字号缓存)
+        num = self._team_number(max(8, int(body_w * 0.35)))
         screen.blit(num, (cx_i - num.get_width() // 2,
                           by + int(body_h * 0.3) - num.get_height() // 2))
 
@@ -3367,10 +3591,8 @@ class Game:
     # ----- READY 阶段 -----
     def _draw_ready_overlay(self, screen):
         # 半透明覆盖
-        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         alpha = min(180, int(self.intro_t * 400))
-        s.fill((0, 0, 0, alpha))
-        screen.blit(s, (0, 0))
+        screen.blit(self._dim_overlay(alpha), (0, 0))
         # 文字
         if self.attacker_is_player:
             big = self.font_xl.render("你来射门!", True, GREEN)
@@ -3583,23 +3805,9 @@ class Game:
         cells_x = [-w / 2, -w / 6, w / 6, w / 2]
         cells_y = [0, h / 3, 2 * h / 3, h]
         # 半透明覆盖球门区域
-        # 画格子线
-        grid_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        for i in range(1, 3):
-            t = i / 3.0
-            x = -w / 2 + w * t
-            p1 = project(x, 0, gz)
-            p2 = project(x, h, gz)
-            pygame.draw.line(grid_surf, (255, 255, 255, 80),
-                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
-        for i in range(1, 3):
-            t = i / 3.0
-            y = h * t
-            p1 = project(-w / 2, y, gz)
-            p2 = project(w / 2, y, gz)
-            pygame.draw.line(grid_surf, (255, 255, 255, 80),
-                             (p1[0], p1[1]), (p2[0], p2[1]), 2)
-        screen.blit(grid_surf, (0, 0))
+        # 画格子线 —— 静态, 只画一次后缓存(原来每帧新建一块全屏 SRCALPHA)
+        self._ensure_static_layers()
+        screen.blit(self._grid_cache, (0, 0))
 
         # 当前选中的格子 - 高亮
         # 防御: aim_cell 可能因状态切换残留非法值(0/-1), 兜底回中路
@@ -3619,7 +3827,7 @@ class Game:
         p3 = project(x2, y2, gz)
         p4 = project(x1, y2, gz)
         # 高亮
-        hl = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        hl = self._clear_overlay()
         color = (255, 220, 100, 100) if mode == "shoot" else (100, 200, 255, 100)
         pygame.draw.polygon(hl, color,
                              [(p1[0], p1[1]), (p2[0], p2[1]),
@@ -3725,10 +3933,8 @@ class Game:
 
     # ----- 结果显示 -----
     def _draw_result_overlay(self, screen):
-        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         alpha = min(120, int(self.result_t * 200))
-        s.fill((0, 0, 0, alpha))
-        screen.blit(s, (0, 0))
+        screen.blit(self._dim_overlay(alpha), (0, 0))
         # 结果文字
         if self.last_outcome == "GOAL":
             txt = self.font_xl.render(self.last_result_text, True, GOLD)
@@ -3764,9 +3970,7 @@ class Game:
 
     def _draw_gameover(self, screen):
         """赛后数据统计界面 - 全面分析."""
-        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        s.fill((0, 0, 0, 200))
-        screen.blit(s, (0, 0))
+        screen.blit(self._dim_overlay(200), (0, 0))
 
         st = self.match_stats
         # 标题
