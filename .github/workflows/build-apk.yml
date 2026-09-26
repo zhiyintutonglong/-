@@ -11,6 +11,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write   # 用于把首次生成的固定签名 keystore 提交回仓库
 
     steps:
       - name: 检出代码
@@ -58,6 +60,20 @@ jobs:
           rm -rf ~/.buildozer/android/platform/python-for-android
           echo "已清理 .buildozer 与克隆的 p4a, 将用 Python 3.10.13 重新构建"
 
+      - name: 准备固定签名 keystore(支持覆盖安装, 无需先卸载旧版)
+        run: |
+          set -e
+          if [ ! -f android/debug.keystore ]; then
+            echo "未找到固定 keystore, 用 keytool 生成..."
+            keytool -genkeypair -v \
+              -keystore android/debug.keystore \
+              -alias dqls -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=DQLS, OU=Game, O=DQSL, L=CN, ST=CN, C=CN" \
+              -storepass dqls1234 -keypass dqls1234
+          else
+            echo "已存在固定 keystore, 直接复用"
+          fi
+
       - name: 编译 APK(首次约 20-40 分钟, 会自动下载 Android SDK/NDK)
         run: |
           buildozer -v android debug
@@ -67,6 +83,19 @@ jobs:
         run: |
           rm -rf .buildozer
           buildozer -v android debug
+
+      - name: 提交 keystore 回仓库(仅首次生成时)
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f android/debug.keystore ] && ! git ls-files --error-unmatch android/debug.keystore >/dev/null 2>&1; then
+            git add android/debug.keystore
+            git commit -m "chore: 添加固定签名 keystore(支持覆盖安装)"
+            git push
+          else
+            echo "keystore 已在版本控制中, 无需提交"
+          fi
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
