@@ -5,14 +5,14 @@
 
 控制说明:
   射门阶段:
-    方向键 / 小键盘 1-9  -> 选择射门目标(九宫格)
+    手机点九宫格 / 电脑数字键1-9或方向键 -> 选择射门目标(九宫格)
     空格键                -> 蓄力(按住)/射门(松开)
   守门阶段:
-    方向键 / 小键盘 1-9  -> 选择扑救方向(九宫格)
+    手机点九宫格 / 电脑数字键1-9或方向键 -> 选择扑救方向(九宫格)
   其他:
-    Enter / 空格          -> 确认/继续
+    点击 / 空格 / Enter     -> 确认/继续
     R                     -> 重新开始
-    ESC                   -> 退出/返回菜单
+    菜单按钮 / ESC         -> 退出/返回菜单
 
 依赖: pygame-ce (>=2.5)
 运行: python game.py
@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.05"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.06"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -219,7 +219,62 @@ CELL_ADJACENT = {
     8: [4, 5, 6, 7, 9],  # 中下: 左中,中中,右中,左下,右下
     9: [5, 6, 8],        # 右下: 中中,右中,中下
 }
-# 四角格子(反应属性判定)
+# 九宫格 -> 球门内坐标矩形 (x1,x2,y1,y2). 编号 1/2/3 = 上排, 7/8/9 = 下排.
+# 关键: 世界坐标 y 越大越靠上, 而编号的行号必须从下往上数, 否则"选中数字"
+# 与"高亮光标"会上下颠倒 —— 这正是 v1.05 及之前两端都出现的错位 bug 根因.
+def cell_rect(cell: int):
+    # 返回编号对应的球门内矩形, 行号已翻转, 与数字标签/网格完全一致.
+    cell = max(1, min(9, cell))
+    col = (cell - 1) % 3
+    row = 2 - (cell - 1) // 3
+    w, h = GOAL_W, GOAL_H
+    x1 = -w / 2 + (w / 3) * col
+    x2 = x1 + w / 3
+    y1 = (h / 3) * row
+    y2 = y1 + h / 3
+    return x1, x2, y1, y2
+
+# 射门出球速度模型(v1.06 重新标定).
+#   * 杰瑞(力量7) 0疲劳 / 10%力度  ≈ 15 m/s, 作为"标准球".
+#   * 0疲劳 / 50%力度时: 詹姆斯25, 杰瑞21, 兔同笼21, 牢二24 (m/s).
+#   * 詹姆斯"超大力"技能 + 满体力100力度 → 约 60 m/s.
+#   * 加入 ±8% 概率浮动, 让每次射门略有差异.
+SPD_SLOPE = 15.0                       # 力度条每 +100% 增加的出球速度
+SPD_LO = {7: 13.5, 8: 16.5, 9: 17.5}  # 0力度时的基础速度(按力量属性区分)
+POWER_SHOT_BOOST = 1.846              # 超大力技能倍率(詹姆斯满力 ≈ 60 m/s)
+
+def _shot_speed(frac, attr, fatigue, skill=False):
+    # 计算射门出球速度(已含疲劳衰减与概率浮动).
+    f = max(0.0, min(1.0, frac))
+    base = SPD_LO.get(attr, 15.0) + SPD_SLOPE * f
+    base *= random.uniform(0.92, 1.08)                 # 概率浮动
+    if fatigue > 0:
+        base *= (1.0 - fatigue * 0.04)                 # 疲劳降速(加强后)
+    if skill:
+        base *= POWER_SHOT_BOOST
+    return max(6.0, base)
+
+def _android_vibrate(ms):
+    # 手机端震动反馈; 非安卓 / 无权限时静默跳过. 必须在主线程调用.
+    if not IS_ANDROID:
+        return
+    try:
+        from jnius import autoclass
+        Context = autoclass("android.content.Context")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ctx = PythonActivity.mActivity
+        vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
+        if vib is None:
+            return
+        try:
+            VibrationEffect = autoclass("android.os.VibrationEffect")
+            vib.vibrate(VibrationEffect.createOneShot(
+                int(ms), VibrationEffect.DEFAULT_AMPLITUDE))
+        except Exception:
+            vib.vibrate(int(ms))
+    except Exception:
+        pass
+
 CORNER_CELLS = {1, 3, 7, 9}
 KEY_TO_CELL = {
     # 主键盘数字键: 按九宫格编号 1..9 (1左上 -> 9右下), 与画面上的编号一致
@@ -286,7 +341,7 @@ STRIKERS: List[StrikerProfile] = [
     ),
     StrikerProfile(
         "curve", "兔同龙",
-        power=8, accuracy=5, composure=6,
+        power=7, accuracy=7, composure=6,
         color=(180, 100, 220), skin=(228, 192, 154),
         desc="香蕉球:球带强侧旋在空中真实弯曲,可选2个相邻格,克制反应型门将",
         skill="curve", skill_name="弧线球",
@@ -1044,14 +1099,7 @@ class Game:
         gz = GOAL_Z
         w, h = GOAL_W, GOAL_H
         for cell in range(1, 10):
-            col = (cell - 1) % 3
-            # 编号 1/2/3 是"上排", 7/8/9 是"下排";
-            # 世界坐标 y 越大越靠上, 所以行号必须翻转, 否则点击会上下颠倒
-            row = 2 - (cell - 1) // 3
-            x1 = -w / 2 + (w / 3) * col
-            x2 = x1 + w / 3
-            y1 = (h / 3) * row
-            y2 = y1 + h / 3
+            x1, x2, y1, y2 = cell_rect(cell)
             p1 = project(x1, y1, gz)
             p2 = project(x2, y1, gz)
             p3 = project(x2, y2, gz)
@@ -1099,7 +1147,7 @@ class Game:
         sp_power = self.striker_profile.power if self.attacker_is_player else (
             self.ai_striker_profile.power if self.ai_striker_profile else 8)
         # 估算出球速度, 再乘以空气阻力衰减 = 到达门线时的真实速度
-        est_speed = (14 + sp_power * 1.1 + power * 5.0) * SPEED_DECAY
+        est_speed = (SPD_LO.get(sp_power, 15.0) + SPD_SLOPE * power) * SPEED_DECAY
         if est_speed < 19.0:
             return "weak", "弱力", GREEN, "球速慢 - 反应时间充足, 相邻格也能靠臂展扑到"
         elif est_speed < 23.5:
@@ -1117,7 +1165,7 @@ class Game:
             power = self.power_value
         sp_power = self.striker_profile.power if self.attacker_is_player else (
             self.ai_striker_profile.power if self.ai_striker_profile else 8)
-        return (14 + sp_power * 1.1 + power * 5.0) * SPEED_DECAY
+        return (SPD_LO.get(sp_power, 15.0) + SPD_SLOPE * power) * SPEED_DECAY
 
     def _adjacent_save_prob(self, speed: float = None) -> float:
         """门将选到相邻格(臂展覆盖)时的扑救成功率 - 臂展越长越高, 球越慢越高."""
@@ -1593,7 +1641,7 @@ class Game:
         self.player_shot_history.append(self.aim_cell)
         self.player_power_history.append(power)
         # 疲劳: 力度上限降低(疲劳10->力度上限20%)
-        fatigue_power_cap = 1.0 - self.player_fatigue * 0.08
+        fatigue_power_cap = 1.0 - self.player_fatigue * 0.12
         power = min(power, max(0.25, fatigue_power_cap))
 
         # 弧线球: 在两格间随机落点(无限使用,不需充能)
@@ -1639,7 +1687,7 @@ class Game:
             ot_bonus = sp.composure / 10.0 * 0.15  # composure10->偏差减15%
             noise_amp *= (1.0 - ot_bonus)
         # 疲劳增加偏差
-        fatigue_penalty = self.player_fatigue * 0.08
+        fatigue_penalty = self.player_fatigue * 0.14
         noise_amp += fatigue_penalty
         # 力度系数
         power_factor = 0.3 + 0.7 * min(1.0, power)
@@ -1653,11 +1701,8 @@ class Game:
         dev_y = random.gauss(0, 1.2 * noise_amp * power_factor)
         actual_tx = tx + dev_x
         actual_ty = max(0.05, ty + dev_y)
-        # 球速(向前分量) - 力量决定上限, 疲劳降速
-        speed = 12 + sp.power * 1.3 + min(1.0, power) * 5.0
-        speed *= (1.0 - self.player_fatigue * 0.02)
-        if is_power_shot:
-            speed *= 1.3
+        # 球速(向前分量) - 力量决定上限, 疲劳降速(v1.06 重新标定 + 概率浮动)
+        speed = _shot_speed(power, sp.power, self.player_fatigue, is_power_shot)
         # 自转(rad/s, 绕竖直轴): 弧线球给强侧旋, 普通球只有轻微随机旋转
         # 真实香蕉球约 8~12 转/秒; 弧线球为了踢出旋转必须"搓"球,
         # 触球不实 => 球速下降约12%(这也是真实规律)
@@ -1746,7 +1791,7 @@ class Game:
         tx, ty, power = self.ai_target
         ai_sp = self.ai_striker_profile if self.ai_striker_profile else random.choice(STRIKERS)
         # 疲劳: 力度上限降低
-        fatigue_power_cap = 1.0 - self.ai_fatigue * 0.08
+        fatigue_power_cap = 1.0 - self.ai_fatigue * 0.12
         power = min(power, max(0.25, fatigue_power_cap))
         # AI 技能生效(决策阶段已选定, 这里只负责生效 + 扣充能)
         ai_skill = getattr(self, "ai_selected_skill", "normal")
@@ -1769,7 +1814,7 @@ class Game:
             ot_bonus = ai_sp.composure / 10.0 * 0.15
             noise_amp *= (1.0 - ot_bonus)
         # 疲劳增加偏差
-        fatigue_penalty = self.ai_fatigue * 0.08
+        fatigue_penalty = self.ai_fatigue * 0.14
         noise_amp += fatigue_penalty
         power_factor = 0.3 + 0.7 * min(1.0, power)
         # 大力射门偏差: 准度影响惩罚系数
@@ -1782,10 +1827,8 @@ class Game:
         actual_tx = tx + dev_x
         actual_ty = max(0.05, ty + dev_y)
         # 球速 - 力量决定上限(与玩家一致)
-        speed = 12 + ai_sp.power * 1.3 + min(1.0, power) * 5.0
-        speed *= (1.0 - self.ai_fatigue * 0.02)
-        if ai_skill == "power_shot":
-            speed *= 1.3    # 超大力射门加成
+        speed = _shot_speed(power, ai_sp.power, self.ai_fatigue,
+                            ai_skill == "power_shot")
         # AI 弧线球同样用真实侧旋(马格努斯力), 搓球同样损失球速
         if ai_skill == "curve":
             speed *= 0.88
@@ -2212,7 +2255,8 @@ class Game:
         if self.last_ball_speed > self.match_stats["max_ball_speed"]:
             self.match_stats["max_ball_speed"] = self.last_ball_speed
         skill_used = self._shot_skill != "normal"
-        is_power = self._shot_skill == "power_shot"
+        # v1.06: "超大力射门"统计口径改为 到达门线速度>=25 的所有射门
+        is_power = self.last_ball_speed >= 25.0
         if self.attacker_is_player:
             # 玩家射门 -> 结果归玩家; 被扑出 = AI 门将扑救 +1
             self.match_stats["player_shots"] += 1
@@ -2239,10 +2283,16 @@ class Game:
                 self.match_stats["ai_skill_uses"] += 1
             if is_power:
                 self.match_stats["ai_power_shots"] += 1
+        # 超大力射门进球: 手机端画面轻微震荡 + 震动反馈(v1.06 新增)
+        if scored and is_power:
+            self.shake_t = max(self.shake_t, 0.45)
+            self.shake_amp = max(self.shake_amp, 11)
+            if IS_ANDROID:
+                _android_vibrate(45)
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
-            if self.last_ball_speed > 27:
+            if self.last_ball_speed >= 25:
                 event_text = f"R{self.round_num} {'玩家' if self.attacker_is_player else 'AI'}重炮进球 {self.last_ball_speed:.0f}m/s"
             else:
                 event_text = f"R{self.round_num} {'玩家' if self.attacker_is_player else 'AI'}进球"
@@ -2486,25 +2536,46 @@ class Game:
         title = self.font_xl.render("操作说明", True, WHITE)
         screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 60))
         # 说明内容
-        lines = [
-            ("射门阶段", GOLD),
-            ("  鼠标点击球门九宫格 / 数字键1-9 选目标", WHITE),
-            ("  点击「蓄力射门」按钮 / 按空格 开始蓄力", WHITE),
-            ("  蓄力条摆动时, 点击「点击射门」/ 松开空格 射门", WHITE),
-            ("  力度越大球越快越难扑, 但准度下降可能射偏", (210, 210, 210)),
-            ("", WHITE),
-            ("守门阶段", BLUE),
-            ("  观察左上角力度等级(弱/中/强)选择策略", WHITE),
-            ("  鼠标点击球门九宫格 / 数字键1-9 选扑救方向", WHITE),
-            ("  点击「确认扑救」按钮 / 按空格 确认", WHITE),
-            ("  弱力球: 精确扑(选对方向+高度)概率最高", (210, 210, 210)),
-            ("  重力球: 赌大方向(选对左/中/右)更划算", (210, 210, 210)),
-            ("", WHITE),
-            ("通用", GOLD),
-            ("  R 重新开始   ESC 返回菜单/退出   鼠标全程可用", WHITE),
-            ("  5轮平局后进入加时赛(突然死亡)", WHITE),
-            ("  一方已无法追平时, 可选择继续或提前结算", WHITE),
-        ]
+        if IS_ANDROID:
+            lines = [
+                ("射门阶段", GOLD),
+                ("  点击球门九宫格选射门目标", WHITE),
+                ("  点击「蓄力射门」按钮开始蓄力", WHITE),
+                ("  蓄力条摆动时, 点击「射门」按钮射门", WHITE),
+                ("  力度越大球越快越难扑, 但准度下降可能射偏", (210, 210, 210)),
+                ("", WHITE),
+                ("守门阶段", BLUE),
+                ("  观察左上角力度等级(弱/中/强)选择策略", WHITE),
+                ("  点击球门九宫格选扑救方向", WHITE),
+                ("  点击「确认扑救」按钮确认", WHITE),
+                ("  弱力球: 精确扑(选对方向+高度)概率最高", (210, 210, 210)),
+                ("  重力球: 赌大方向(选对左/中/右)更划算", (210, 210, 210)),
+                ("", WHITE),
+                ("通用", GOLD),
+                ("  点击「菜单」按钮返回菜单   全程触摸操作", WHITE),
+                ("  5轮平局后进入加时赛(突然死亡)", WHITE),
+                ("  一方已无法追平时, 可选择继续或提前结算", WHITE),
+            ]
+        else:
+            lines = [
+                ("射门阶段", GOLD),
+                ("  鼠标点击球门九宫格 / 数字键1-9 选目标", WHITE),
+                ("  点击「蓄力射门」按钮 / 按空格 开始蓄力", WHITE),
+                ("  蓄力条摆动时, 点击「点击射门」/ 松开空格 射门", WHITE),
+                ("  力度越大球越快越难扑, 但准度下降可能射偏", (210, 210, 210)),
+                ("", WHITE),
+                ("守门阶段", BLUE),
+                ("  观察左上角力度等级(弱/中/强)选择策略", WHITE),
+                ("  鼠标点击球门九宫格 / 数字键1-9 选扑救方向", WHITE),
+                ("  点击「确认扑救」按钮 / 按空格 确认", WHITE),
+                ("  弱力球: 精确扑(选对方向+高度)概率最高", (210, 210, 210)),
+                ("  重力球: 赌大方向(选对左/中/右)更划算", (210, 210, 210)),
+                ("", WHITE),
+                ("通用", GOLD),
+                ("  R 重新开始   ESC 返回菜单/退出   鼠标全程可用", WHITE),
+                ("  5轮平局后进入加时赛(突然死亡)", WHITE),
+                ("  一方已无法追平时, 可选择继续或提前结算", WHITE),
+            ]
         y = 140
         for text, color in lines:
             if text:
@@ -2612,8 +2683,10 @@ class Game:
                               rect[1] + rect[3] // 2 - txt.get_height() // 2))
 
         # 底部提示
-        tip = self.font_s.render("鼠标点击 / ↑↓ 选择   Enter/空格/点击 确认   ESC 退出",
-                                  True, HUD_FG)
+        tip_text = ("点击卡片选择   点击确认   (返回: 菜单按钮)"
+                    if IS_ANDROID else
+                    "鼠标点击 / ↑↓ 选择   Enter/空格/点击 确认   ESC 退出")
+        tip = self.font_s.render(tip_text, True, HUD_FG)
         screen.blit(tip, (WIDTH // 2 - tip.get_width() // 2, HEIGHT - 60))
 
     def _draw_distant_goal(self, screen, cx, gz):
@@ -2699,7 +2772,10 @@ class Game:
             "臂展越长 -> 差一格(相邻格)也越容易扑到, 球速越慢效果越明显",
             True, (200, 225, 170))
         screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2, HEIGHT - 82))
-        tip = self.font_s.render("鼠标点击卡片 / ← → 切换   Enter/空格/点击 确认   (返回: ESC)", True, HUD_FG)
+        tip_text = ("滑动或点击卡片选择   点击确认   (返回: 菜单按钮)"
+                    if IS_ANDROID else
+                    "鼠标点击卡片 / ← → 切换   Enter/空格/点击 确认   (返回: ESC)")
+        tip = self.font_s.render(tip_text, True, HUD_FG)
         screen.blit(tip, (WIDTH // 2 - tip.get_width() // 2, HEIGHT - 50))
 
     def _draw_player_card(self, screen, x, y, w, h, name, stats, color, skin,
@@ -3978,17 +4054,22 @@ class Game:
                 sp = self.striker_profile
                 if sp.skill == "curve" and self.selected_skill == "curve":
                     if self.curve_cell2 == -1:
-                        tip = "弧线球: 再点击一个相邻格子选第二目标  Q取消"
+                        tip = ("弧线球: 再点击一个相邻格子选第二目标   点技能按钮取消"
+                               if IS_ANDROID else
+                               "弧线球: 再点击一个相邻格子选第二目标  Q取消")
                     elif self.curve_cell2 > 0:
                         tip = "弧线球双格已选  点击蓄力射门  再点格子重选"
                     else:
                         tip = "弧线球已激活: 点击格子选第一目标"
                 elif sp.skill != "none":
-                    tip = "点击九宫格选目标  Q/点击技能按钮切换技能  蓄力射门"
+                    tip = ("点击九宫格选目标  点击技能按钮切换技能  蓄力射门"
+                           if IS_ANDROID else
+                           "点击九宫格选目标  Q/点击技能按钮切换技能  蓄力射门")
                 else:
                     tip = "点击九宫格选目标  点击蓄力射门按钮开始蓄力"
             else:
-                tip = "点击射门按钮 / 松开空格 → 射门!"
+                tip = ("点击「射门」按钮 → 射门!"
+                       if IS_ANDROID else "点击射门按钮 / 松开空格 → 射门!")
         else:
             tip = "点击九宫格选扑救方向  点击确认扑救"
         tip_s = self.font_m.render(tip, True, WHITE)
@@ -4086,12 +4167,7 @@ class Game:
             self.aim_cell = 5
         cx, cy = CELL_CENTERS[self.aim_cell]
         # 计算格子范围
-        col = (self.aim_cell - 1) % 3
-        row = (self.aim_cell - 1) // 3
-        x1 = -w / 2 + (w / 3) * col
-        x2 = x1 + w / 3
-        y1 = (h / 3) * row
-        y2 = y1 + h / 3
+        x1, x2, y1, y2 = cell_rect(self.aim_cell)
         # 四角投影
         p1 = project(x1, y1, gz)
         p2 = project(x2, y1, gz)
@@ -4113,12 +4189,7 @@ class Game:
         # 弧线球: 高亮第二格(紫色)
         if self.curve_cell2 > 0:
             cx2, cy2 = CELL_CENTERS[self.curve_cell2]
-            col2 = (self.curve_cell2 - 1) % 3
-            row2 = (self.curve_cell2 - 1) // 3
-            x1b = -w / 2 + (w / 3) * col2
-            x2b = x1b + w / 3
-            y1b = (h / 3) * row2
-            y2b = y1b + h / 3
+            x1b, x2b, y1b, y2b = cell_rect(self.curve_cell2)
             q1 = project(x1b, y1b, gz)
             q2 = project(x2b, y1b, gz)
             q3 = project(x2b, y2b, gz)
@@ -4136,12 +4207,7 @@ class Game:
         # 弧线模式等待第二格: 高亮可选相邻格
         if self.curve_cell2 == -1 and mode == "shoot":
             for adj in CELL_ADJACENT.get(self.aim_cell, []):
-                col_a = (adj - 1) % 3
-                row_a = (adj - 1) // 3
-                xa = -w / 2 + (w / 3) * col_a
-                xb = xa + w / 3
-                ya = (h / 3) * row_a
-                yb = ya + h / 3
+                xa, xb, ya, yb = cell_rect(adj)
                 a1 = project(xa, ya, gz)
                 a2 = project(xb, ya, gz)
                 a3 = project(xb, yb, gz)
@@ -4199,7 +4265,9 @@ class Game:
         pct = self.font_m.render(f"{int(self.power_value * 100)}%", True, WHITE)
         screen.blit(pct, (bar_x + bar_w + 12, bar_y))
         # 提示
-        hint = self.font_s.render("点击射门按钮 / 松开空格 → 射门", True, GOLD)
+        hint_text = ("点击「射门」按钮 → 射门" if IS_ANDROID
+                     else "点击射门按钮 / 松开空格 → 射门")
+        hint = self.font_s.render(hint_text, True, GOLD)
         screen.blit(hint, (WIDTH // 2 - hint.get_width() // 2, bar_y - 28))
 
     # ----- 结果显示 -----
