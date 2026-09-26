@@ -14,6 +14,11 @@ import sys
 import time
 import traceback
 
+# 必须在 pygame(S SDL)初始化之前设置: 关闭"触屏模拟鼠标"事件。
+# 默认 SDL 一次触摸会同时发 FINGERDOWN 和 MOUSEBUTTONDOWN,
+# 导致一次点击被游戏处理两次(选人就跳过了)。
+os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
