@@ -12,7 +12,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt
 
 # 版本(与 VERSION.txt 保持一致)
-version = 1.06
+version = 1.07
 
 # 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
 # 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
