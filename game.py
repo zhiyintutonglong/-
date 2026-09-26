@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.07"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.08"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -254,7 +254,8 @@ def _shot_speed(frac, attr, fatigue, skill=False):
         base *= POWER_SHOT_BOOST
     return max(6.0, base)
 
-# 缓存 Vibrator 句柄: 第一次成功拿到后复用; 若确认拿不到则置 False 直接跳过.
+# 缓存 Vibrator 句柄: 第一次成功拿到后复用; 取不到则下次重试(不永久禁用,
+# 避免某次初始化时序问题把震动彻底关掉). 仅当 jnius 完全不可用才永久禁用.
 _vibrator = None
 
 def _android_vibrate(ms):
@@ -282,25 +283,28 @@ def _android_vibrate(ms):
                 except Exception:
                     ctx = None
             if ctx is None:
-                _vibrator = False
+                # 这次没拿到 Context, 下次再试(不永久禁用)
+                _vibrator = None
                 return
             Context = autoclass("android.content.Context")
             vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
             if vib is None:
-                _vibrator = False
+                _vibrator = None
                 return
             _vibrator = vib
         vib = _vibrator
         try:
             VibrationEffect = autoclass("android.os.VibrationEffect")
-            # 中等强度短震(默认振幅在部分机型上几乎无感, 这里用 200/255 确保能感知)
+            # 中等强度短震(振幅 200/255, 在多数机型上明显可感)
             vib.vibrate(VibrationEffect.createOneShot(int(ms), 200))
         except Exception:
             try:
                 vib.vibrate(int(ms))
             except Exception:
-                _vibrator = False
+                # 本次调用失败, 允许下次重试
+                _vibrator = None
     except Exception:
+        # jnius 完全不可用(理论上不会发生, 因为已打进包), 永久禁用避免每次都 import 报错
         _vibrator = False
 
 CORNER_CELLS = {1, 3, 7, 9}
@@ -2069,6 +2073,15 @@ class Game:
         self.save_fail_reason = ""
         self.ball.active = False
         bx, by, bz = self.ball.x, self.ball.y, GOAL_Z
+        # 结算瞬间把守门员"落位"到它承诺扑救的格子: 这样画面上守门员所在位置
+        # 与判定用的格子完全一致, 消除"球在角上、门将却还在中间却判定扑出"的矛盾.
+        # (动画过程仍是扑出动作, 只是定格时对齐到承诺的格子.)
+        if getattr(self.keeper, "committed", False):
+            self.keeper.x = self.keeper.target_x
+            self.keeper.y = self.keeper.target_y
+            self.keeper.diving = True
+            self.keeper.landed = True
+            self.keeper.dive_t = 0.42   # 定格为"已扑到承诺格子"的完整动作姿态
         # 1. 是否在球门内?(用球心判定, 与真实规则一致: 球整体越过门线)
         in_goal = (-GOAL_W / 2 <= bx <= GOAL_W / 2) and (0 <= by <= GOAL_H)
         if not in_goal:
@@ -2099,7 +2112,8 @@ class Game:
 
         # 3. 方向判定 - 精确到格子级
         ball_cell = self._pos_to_cell(bx, by)
-        keeper_cell = self._pos_to_cell(self.keeper.target_x, self.keeper.target_y)
+        # 用守门员实际落位(已在结算瞬间对齐到承诺格子)判定, 与画面显示完全一致
+        keeper_cell = self._pos_to_cell(self.keeper.x, self.keeper.y)
         dir_correct = (ball_cell == keeper_cell)
         # 相邻格子(臂展覆盖)
         is_adjacent = (not dir_correct and
@@ -2222,8 +2236,17 @@ class Game:
         # 抛硬币判定
         if random.random() < base_prob:
             self.last_outcome = "SAVE"
-            who = "你扑出了!" if not self.attacker_is_player else "AI扑出了!"
-            self.last_result_text = who
+            # 明确区分"同格扑出"与"相邻格·臂展扑出", 并附本次扑救成功率,
+            # 让玩家看懂判定(同格概率高, 相邻格靠臂展、概率随球速/臂展变化).
+            pct = max(0, min(100, int(base_prob * 100)))
+            if dir_correct:
+                stype = "同格"
+            elif is_adjacent:
+                stype = "相邻格·臂展"
+            else:
+                stype = "极限"
+            who = "你扑出了" if not self.attacker_is_player else "AI扑出了"
+            self.last_result_text = "%s（%s %d%%）" % (who, stype, pct)
             self._finish_shot(False)
             self.shake_t = 0.35
             self.shake_amp = 7
@@ -2320,12 +2343,19 @@ class Game:
                 self.match_stats["ai_skill_uses"] += 1
             if is_power:
                 self.match_stats["ai_power_shots"] += 1
-        # 超大力射门进球: 手机端画面轻微震荡 + 震动反馈(v1.06 新增)
-        if scored and is_power:
-            self.shake_t = max(self.shake_t, 0.45)
-            self.shake_amp = max(self.shake_amp, 11)
-            if IS_ANDROID:
-                _android_vibrate(80)
+        # 手机端震感反馈(v1.08: 任意进球/扑救都给震动, 超大力进球更强 + 画面轻震)
+        # 之前只在"超大力进球"才震, 实战里极少触发, 用户感知为"完全没震动".
+        if IS_ANDROID:
+            oc = self.last_outcome
+            if oc == "GOAL":
+                if is_power:
+                    self.shake_t = max(self.shake_t, 0.45)
+                    self.shake_amp = max(self.shake_amp, 11)
+                    _android_vibrate(140)
+                else:
+                    _android_vibrate(70)
+            elif oc == "SAVE":
+                _android_vibrate(95)
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
