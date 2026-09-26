@@ -12,7 +12,12 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt
 
 # 版本(与 VERSION.txt 保持一致)
-version = 1.03
+version = 1.04
+
+# 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
+# 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
+# 代价只是 APK 变大。钩子内部全 try/except, 失败也只是回到默认压缩, 不会搞挂编译。
+p4a.hook = %(source.dir)s/_p4a_hook.py
 
 # 依赖: python3 + pygame-ce
 # 版本锁定(踩坑经验, 重要):
