@@ -590,7 +590,7 @@ def vib_status_lines():
     err = v.get("err", "-")
     if err and err != "-":
         # 出错时优先显示错误(比"还没测过"的提示有用)
-        lines.append(("错误: %s" % err[:64], (255, 130, 130)))
+        lines.append(("错误: %s" % err[:52], (255, 130, 130)))
     elif v.get("calls", 0) == 0:
         lines.append(("点「测试震动」试一下马达; 静音/勿扰模式部分机型不震",
                       (255, 220, 150)))
