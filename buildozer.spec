@@ -12,7 +12,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt
 
 # 版本(与 VERSION.txt 保持一致)
-version = 1.05
+version = 1.06
 
 # 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
 # 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
@@ -38,7 +38,7 @@ p4a.hook = %(source.dir)s/_p4a_hook.py
 # 在 x86_64 的 CI 主机上装 manylinux 的 x86_64 轮子, 导致 base.so 全是 X86_64,
 # 手机 dlopen 报 "is for EM_X86_64 (62) instead of EM_AARCH64 (183)" 直接闪退
 # (这就是 v1.00 闪退的真正原因, 与 Python 版本无关)。
-requirements = python3==3.10.13,hostpython3==3.10.13,pygame
+requirements = python3==3.10.13,hostpython3==3.10.13,pygame,pyjnius
 
 # 横屏 + 全屏(点球游戏必须横屏才好看)
 orientation = landscape
@@ -53,7 +53,7 @@ android.api = 33
 # 必须 >= 24: Python 3.14 的 remote_debugging 用到 preadv/pwritev,
 # bionic 从 API 24 才提供, minapi=23 时会报 "call to undeclared function" 硬错误
 android.minapi = 24
-android.permissions =
+android.permissions = VIBRATE
 android.allow_backup = True
 # 自动接受 Android SDK 协议(云端无人值守编译必须)
 android.accept_sdk_license = True
