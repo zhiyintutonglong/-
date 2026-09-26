@@ -811,6 +811,9 @@ class Ball:
     active: bool = False
     air_t: float = 0.0       # 已飞行时间(s)
     trail: List[Tuple[float, float, float]] = field(default_factory=list)
+    # 进球后惯性滑入网兜的残余运动
+    net_roll_t: float = 0.0  # 滑入动画已进行时间(s)
+    net_roll_vz: float = 0.0  # 滑入初速(从进球瞬间的 vz 继承)
 
     @property
     def speed(self) -> float:
@@ -2265,6 +2268,32 @@ class Game:
                     kp = (random.choice(KEEPERS) if self.attacker_is_player
                           else self.keeper_profile)
                 self._update_keeper_dive(dt, kp)
+            # v1.12: 进球后球带着惯性继续滑入网兜(NET_DEPTH 范围内)
+            if self.last_outcome == "GOAL" and self.ball.net_roll_t > 0:
+                self.ball.net_roll_t += dt
+                # 减速度模拟网兜阻力, 大约 0.6s 停住
+                decel = 8.0
+                self.ball.net_roll_vz = max(0.0, self.ball.net_roll_vz - decel * dt)
+                self.ball.z += self.ball.net_roll_vz * dt
+                # 球旋转继续(视觉)
+                self.ball.spin += self.ball.net_roll_vz * dt * 3.0
+                # 到达网底或速度耗尽 -> 停住
+                if self.ball.z >= GOAL_Z + NET_DEPTH - 0.15:
+                    self.ball.z = GOAL_Z + NET_DEPTH - 0.15
+                    self.ball.net_roll_vz = 0.0
+                    self.ball.net_roll_t = 0.0
+                elif self.ball.net_roll_vz <= 0.01:
+                    self.ball.net_roll_vz = 0.0
+                    self.ball.net_roll_t = 0.0
+            # v1.12: 扑救成功后球贴到门将怀里(跟着门将位置走)
+            elif self.last_outcome == "SAVE":
+                kp_obj = self.keeper
+                # 球贴在门将身前略偏下(怀里的感觉), 门将还在移动就跟
+                self.ball.x = kp_obj.x + kp_obj.dive_dir * 0.15
+                self.ball.y = max(BALL_RADIUS, kp_obj.y + 0.35)
+                self.ball.z = kp_obj.z + 0.25
+                # 球继续轻微旋转(被抱住过程中)
+                self.ball.spin += dt * 1.5
         elif self.state == State.GAME_OVER:
             pass
 
@@ -2425,6 +2454,9 @@ class Game:
         """球到达球门线时判定结果 - 新属性分工系统."""
         self._break_defense = False
         self.save_fail_reason = ""
+        # 记住球到达门线时的速度(用于进球后惯性滑入网兜)
+        _arrive_vz = self.ball.vz
+        _arrive_vx = self.ball.vx
         self.ball.active = False
         bx, by, bz = self.ball.x, self.ball.y, GOAL_Z
         # v1.09: 不再"瞬移"对齐到承诺格子. 改为在 ROUND_RESULT 阶段让扑救动画
@@ -2605,6 +2637,10 @@ class Game:
                 stype = "极限"
             who = "你扑出了" if not self.attacker_is_player else "AI扑出了"
             self.last_result_text = "%s（%s %d%%）" % (who, stype, pct)
+            # 扑救成功: 球贴到门将怀里(贴近门将当前位置, 表现"抱住")
+            # 门将动画会继续平滑落位到所选格, 球跟着门将走
+            self.ball.net_roll_t = 0.0
+            self.ball.net_roll_vz = 0.0
             self._finish_shot(False)
             self.shake_t = 0.35
             self.shake_amp = 7
@@ -2664,6 +2700,10 @@ class Game:
                 self.shake_amp = 5
                 self.goal_flash = 0.45
             self.last_result_text = who
+            # 进球后: 球带着惯性继续滑入网兜一小段距离(真实足球进网后会继续前冲)
+            # 保留到达门线时的残余前向速度, 用减速度模拟网兜阻力
+            self.ball.net_roll_t = 0.001  # 标记"正在滑入"
+            self.ball.net_roll_vz = max(1.5, abs(_arrive_vz) * 0.35)
             self._finish_shot(True)
             self.goal_effect_t = 1.5
 
