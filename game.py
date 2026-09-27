@@ -3024,9 +3024,9 @@ class Game:
             else:                            # 普通进球: 不震动
                 _VIB["skip"] += 1
         elif oc == "SAVE":
-            if is_power:                     # 扑出的是大力射门 -> 110ms
+            if is_power:                     # 扑出的是大力射门 -> 200ms(用户要求0.2s)
                 if IS_ANDROID:
-                    _android_vibrate(110)
+                    _android_vibrate(200)
             else:                            # 普通扑救: 不震动
                 _VIB["skip"] += 1
         # 记录关键事件
