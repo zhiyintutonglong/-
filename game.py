@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.12"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.13"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -147,9 +147,9 @@ KEEPER_Z = 10.2                        # 守门员初始位置
 SKY_TOP = (96, 165, 235)
 SKY_MID = (140, 195, 245)
 SKY_BOT = (190, 220, 250)
-GRASS_A = (74, 155, 80)
-GRASS_B = (88, 170, 92)
-GRASS_LINE = (60, 140, 65)
+GRASS_A = (43, 133, 63)      # 深绿条纹(现实球场暗条)
+GRASS_B = (57, 148, 72)      # 浅绿条纹(现实球场亮条)
+GRASS_LINE = (230, 230, 235)  # 球场线(白色, 真实球场)
 GOAL_POST = (245, 245, 250)
 GOAL_NET = (240, 240, 245)
 BALL_COLOR = (252, 252, 252)
@@ -255,42 +255,55 @@ def _shot_speed(frac, attr, fatigue, skill=False):
     return max(6.0, base)
 
 # ====================================================================
-# 震动反馈(安卓 Vibrator 服务)
+# 震动反馈(安卓) —— 通知通道方案
 # --------------------------------------------------------------------
-# 目标: 像"来电话"一样明显的马达震动.
-# 之前"怎么都震不起来", 逐个环节堵死:
-#   1) 取不到 Vibrator 服务
-#      -> 现在按多条路径依次尝试: Activity / Application Context, 每种再试
-#         API31+ 的 VibratorManager.getDefaultVibrator()、Context.VIBRATOR_SERVICE、
-#         以及直接写字符串 "vibrator"(个别机型 jnius 读不到静态字段)。
-#   2) Android 8.0+(API26) 起 vibrate() 必须在主线程(Looper)调用
-#      -> SDL 游戏线程无 Looper, 直接调会抛 IllegalStateException;
-#         现在统一 post 到 UI 线程(runOnUiThread -> Handler(getMainLooper) -> 直调)。
-#   3) 部分机型不支持"带振幅的波形", createWaveform 会失败
-#      -> 现在 5 级降级: 带振幅波形 / 单次强震 / 无振幅波形 / 旧 pattern / 旧 ms。
-#   4) 结果不可见, 只能靠猜
-#      -> 每次调用都记录到 _VIB, 在「操作说明」页显示:「测试震动」按钮 + 状态行。
+# 核心改变: 不再直接调 Vibrator.vibrate()(被系统静默拦截),
+# 改为创建带震动属性的 NotificationChannel + 发一条通知,
+# 让系统原生通知震动机制来驱动马达(和"来消息会震"完全一样的路径).
+# 同时保留 Vibrator 直调作为备用, 并把所有步骤写进日志文件供用户上传.
 # ====================================================================
-# 缓存 Vibrator 句柄: 第一次成功拿到后复用; 取不到则下次重试(不永久禁用,
-# 避免某次初始化时序问题把震动彻底关掉). 仅当 jnius 完全不可用才永久禁用.
 _vibrator = None
-_vibrate_activity = None  # 优先用 Activity 切到主线程(部分机型 getMainLooper 也行)
-_vib_disabled = False     # jnius 整个不可用时永久放弃, 避免每帧 import 报错
-_vib_ht = None            # 兜底用的后台 Looper 线程(懒惰创建)
+_vibrate_activity = None
+_vib_disabled = False
+_vib_ht = None
+_vib_channel_created = False
+_vib_log_lines = []     # 日志缓冲(同时写文件)
 
-# 震动自检信息(在「操作说明」页可见, 用来定位"到底哪一步失败")
+
+def _vib_log(msg):
+    """记录震动诊断日志(同时写手机存储文件)."""
+    import time as _t
+    line = "[%s] %s" % (_t.strftime("%H:%M:%S"), msg)
+    _vib_log_lines.append(line)
+    if len(_vib_log_lines) > 200:
+        _vib_log_lines[:] = _vib_log_lines[-200:]
+    # 写文件(安卓外部存储)
+    if IS_ANDROID:
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            f = activity.getExternalFilesDir(None)
+            path = f.getAbsolutePath() + "/vib_debug.log"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
+
 _VIB = {
-    "ctx": "-",     # Context 来源
-    "svc": "-",     # Vibrator 服务获取方式与结果
-    "api": "-",     # Android API 版本
-    "has": "-",     # Vibrator.hasVibrator()
-    "post": "-",    # 投递到哪个线程执行的
-    "method": "-",  # 最后一次实际生效的调用方式
-    "tries": "-",   # 本次尝试的所有路径(诊断用)
-    "calls": 0,     # 已请求震动次数
-    "ok": 0,        # 实际调用成功次数
-    "skip": 0,      # 因规则(普通进球/普通扑救不震)主动跳过次数
-    "err": "-",     # 最后一次错误
+    "ctx": "-",
+    "svc": "-",
+    "api": "-",
+    "has": "-",
+    "post": "-",
+    "method": "-",
+    "tries": "-",
+    "calls": 0,
+    "ok": 0,
+    "skip": 0,
+    "err": "-",
+    "notif": "-",   # 通知通道状态
 }
 
 # jnius 只在安卓打包环境存在, 桌面端 import 会失败 -> 用 try 包住, 失败时留空实现.
@@ -321,8 +334,91 @@ except Exception:
 def _vib_err(msg):
     try:
         _VIB["err"] = str(msg)[:150]
+        _vib_log("ERR: %s" % msg)
     except Exception:
         pass
+
+
+def _vib_create_notification_channel():
+    """创建带震动的通知通道(只创建一次). 用户反馈"来消息会震",
+    说明通知通道震动在系统层是放行的. 这是主赌注."""
+    global _vib_channel_created
+    if _vib_channel_created:
+        return True
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Context = autoclass("android.content.Context")
+        NM = autoclass("android.app.NotificationManager")
+        nm = activity.getSystemService(Context.NOTIFICATION_SERVICE)
+        BuildVer = autoclass("android.os.Build$VERSION")
+        if BuildVer.SDK_INT >= 26:  # API26+ (Android 8.0+)
+            NotificationChannel = autoclass("android.app.NotificationChannel")
+            channelId = "dqls_vib_channel"
+            channel = NotificationChannel(
+                channelId,
+                "游戏震动",
+                NotificationChannel  # IMPORTANCE_DEFAULT = 3
+            )
+            channel.enableVibration(True)
+            # 来电式波形: 0ms延迟, 震100, 歇50, 震100
+            import array
+            pattern = array.array('j', [0, 100, 50, 100])
+            channel.setVibrationPattern(pattern.tolist())
+            nm.createNotificationChannel(channel)
+            _vib_channel_created = True
+            _VIB["notif"] = "通道已建"
+            _vib_log("通知通道创建成功: channelId=%s" % channelId)
+            return True
+        else:
+            _VIB["notif"] = "旧系统无需通道"
+            _vib_channel_created = True
+            return True
+    except Exception as e:
+        _VIB["notif"] = "通道失败:%s" % str(e)[:60]
+        _vib_log("通知通道创建失败: %s" % e)
+        return False
+
+
+def _vib_notify_vibrate(ms):
+    """通过发通知让系统原生震动(和来消息一样的路径)."""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Context = autoclass("android.content.Context")
+        NM = autoclass("android.app.NotificationManager")
+        nm = activity.getSystemService(Context.NOTIFICATION_SERVICE)
+        _vib_create_notification_channel()
+        BuildVer = autoclass("android.os.Build$VERSION")
+        # 用原生 Notification.Builder(不依赖 AndroidX 库)
+        Notification = autoclass("android.app.Notification")
+        if BuildVer.SDK_INT >= 26:
+            builder = Notification.Builder(activity, "dqls_vib_channel")
+        else:
+            builder = Notification.Builder(activity)
+        # 小图标: 用 app 自己的图标
+        try:
+            icon_id = activity.getApplicationInfo().icon
+            if icon_id and icon_id > 0:
+                builder.setSmallIcon(icon_id)
+            else:
+                builder.setSmallIcon(0x01080007)  # android.R.drawable.ic_dialog_info
+        except Exception:
+            builder.setSmallIcon(0x01080007)
+        builder.setContentTitle("点球乱射")
+        builder.setContentText("进球!")
+        # 关键: 设波形让系统震动(来电式)
+        builder.setVibrate([0, int(ms), 50, int(ms)])
+        builder.setPriority(2)  # PRIORITY_HIGH
+        builder.setAutoCancel(True)
+        nm.notify(9991, builder.build())
+        _vib_log("通知震动已发出: ms=%d icon=%s" % (ms, icon_id))
+        return True
+    except Exception as e:
+        _vib_log("通知震动失败: %s" % e)
+        return False
 
 
 def _vib_from_context(ctx, tag):
@@ -459,6 +555,24 @@ def _android_vibrate(ms):
     if ms <= 0:
         ms = 80
     _VIB["calls"] += 1
+    _vib_log("=== vibrate 请求 ms=%d ===" % ms)
+
+    # === 路线 A: 通知通道震动(主赌注) ===
+    # 用户反馈"来消息通知都会震", 说明通知通道在系统层放行.
+    # 先建通道+发通知, 让系统原生震动机制驱动马达.
+    try:
+        ok = _vib_notify_vibrate(ms)
+        if ok:
+            _VIB["ok"] += 1
+            _VIB["method"] = "通知通道"
+            _VIB["err"] = "-"
+            _VIB["post"] = "通知"
+            _vib_log("通知通道震动成功")
+            return True
+    except Exception as e:
+        _vib_log("通知通道异常: %s" % e)
+
+    # === 路线 B: Vibrator 直调(备用) ===
     try:
         from jnius import autoclass
         vib = _vibrator
@@ -619,9 +733,9 @@ def vib_status_lines():
     line1 = "服务=%s API=%s 有马达=%s" % (v.get("svc", "-"),
                                        v.get("api", "-"),
                                        v.get("has", "-"))
-    line2 = "请求%s 成功%s 跳过%s 线程=%s" % (
+    line2 = "请求%s 成功%s 跳过%s 线程=%s 通知=%s" % (
         v.get("calls", 0), v.get("ok", 0), v.get("skip", 0),
-        v.get("post", "-"))
+        v.get("post", "-"), v.get("notif", "-")[:20])
     line3 = "方式=%s 路径=%s" % (v.get("method", "-"),
                               v.get("tries", "-")[:42])
     lines = [(line1, (200, 200, 200)), (line2, (200, 200, 200)),
@@ -2474,6 +2588,14 @@ class Game:
             if hit_frame:
                 self.last_result_text = ("打中门框!" if self.attacker_is_player
                                          else "AI打中门框!")
+                # 门柱门框反弹: 球以射门速度反弹回去
+                _rebound_speed = max(8.0, abs(self.ball.vz))
+                self.ball.active = True  # 重新激活球让物理引擎继续跑
+                self.ball.vz = -_rebound_speed  # 反向飞回
+                self.ball.vx = self.ball.vx * 0.6 + random.uniform(-2.0, 2.0)
+                self.ball.vy = max(2.0, self.ball.vy * 0.5 + 3.0)  # 弹高一点
+                self.ball.net_roll_t = 0.0
+                self.ball.net_roll_vz = 0.0
             else:
                 self.last_result_text = ("射偏了!" if self.attacker_is_player
                                          else "AI射偏了!")
@@ -3540,26 +3662,22 @@ class Game:
                              (p3a[0]+ox, p3a[1]+oy), (p4a[0]+ox, p4a[1]+oy)], 1)
 
     def _draw_gradient_bg(self, screen, top, bot):
-        # 简单垂直渐变
-        h = HEIGHT
-        for i in range(0, h, 4):
-            t = i / h
+        # 简单垂直渐变 - 只画上半部分(天空区域), 下半部分留给草地
+        sky_h = int(HEIGHT * 0.42)  # 天空区域高度
+        for i in range(0, sky_h, 4):
+            t = i / sky_h if sky_h > 0 else 0
             r = int(top[0] * (1 - t) + bot[0] * t)
             g = int(top[1] * (1 - t) + bot[1] * t)
             b = int(top[2] * (1 - t) + bot[2] * t)
             pygame.draw.rect(screen, (r, g, b), (0, i, WIDTH, 4))
 
     def _draw_grass(self, screen, ox=0, oy=0):
-        # 草地用透视网格 - 离摄像机越远越窄
-        # 找到地平线y坐标(无穷远处)
-        horizon_y = HEIGHT // 2 - (0 - CAM_Y) / 1000 * FOCAL + HEIGHT // 2
-        # 草地起点 - 摄像机y=1.9, 草地y=0, 投影y
-        _, gy_proj, _ = project(0, 0, 0.5)
-        grass_top = int(gy_proj)
-        if grass_top < 0:
-            grass_top = 0
-        if grass_top > HEIGHT:
-            grass_top = HEIGHT
+        # 草地: 占画面下方约 62%, 上方是天空+看台
+        # 关键修复: 摄像机高1.9m看地面, 投影 sy = 400 + 1368/z
+        # z=0.5~3.0 时投影远超画面底部(>800), 导致草地完全画不出来 -> 整片蓝色!
+        # 实际可见草地从 z≈3.5(画面底部) 到 z=∞(地平线≈画面中央)
+        # 这里直接用固定分区: 天空0~38%, 看台38~42%, 草地42~100%
+        grass_top = int(HEIGHT * 0.42)  # 草地从画面42%处开始
         # 整片草地
         pygame.draw.rect(screen, GRASS_A,
                          (0, grass_top, WIDTH, HEIGHT - grass_top))
