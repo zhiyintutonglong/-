@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.16"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.17"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -334,6 +334,30 @@ except Exception:
             self._fn = fn
 
 
+# 延迟取消通知用的 Runnable —— 必须定义在模块级!
+# (之前定义在函数体内, 每点一次"测试震动"就重新定义一个 Java 代理类,
+#  pyjnius 反复注册代理类导致 ART 崩溃 —— 这就是"狂点测试震动闪退"的根因)
+try:
+    class _VibCancelRunnable(PythonJavaClass):
+        __javainterfaces__ = ['java/lang/Runnable']
+        __javacontext__ = 'app'
+
+        def __init__(self, nm):
+            super(_VibCancelRunnable, self).__init__()
+            self._nm = nm
+
+        @java_method('()V')
+        def run(self):
+            try:
+                self._nm.cancel(9991)
+            except Exception:
+                pass
+except Exception:
+    class _VibCancelRunnable:
+        def __init__(self, nm):
+            self._nm = nm
+
+
 def _vib_err(msg):
     try:
         _VIB["err"] = str(msg)[:150]
@@ -395,9 +419,38 @@ def _vib_notify_vibrate(ms):
         NM = autoclass("android.app.NotificationManager")
         nm = activity.getSystemService(Context.NOTIFICATION_SERVICE)
         _vib_create_notification_channel()
+        # === 关键诊断: Android 13+(API33) POST_NOTIFICATIONS 是运行时权限! ===
+        # 只在清单里声明没用, 必须弹窗授权; 未授权时 notify() 被系统静默丢弃
+        # (不报错/不显示/不震动) —— 这正是"全部显示成功但没震动"的根因。
+        try:
+            BuildVer = autoclass("android.os.Build$VERSION")
+            if BuildVer.SDK_INT >= 33:
+                granted = activity.checkSelfPermission(
+                    "android.permission.POST_NOTIFICATIONS")
+                _vib_log("POST_NOTIFICATIONS 授权状态: %s (0=已授权)"
+                         % granted)
+                if granted != 0:
+                    _VIB["notif"] = "待授权通知权限"
+                    _vib_log("未授权 -> 弹出系统授权弹窗, 授权后再点测试震动")
+                    activity.requestPermissions(
+                        ["android.permission.POST_NOTIFICATIONS"], 1001)
+                    _vib_err("需要通知权限: 请在弹窗中允许")
+                    return False
+        except Exception as e:
+            _vib_log("权限检查异常: %s" % e)
+        # 诊断: 通知是否被系统允许 + 声音模式
+        try:
+            _vib_log("通知总开关 areNotificationsEnabled=%s"
+                     % nm.areNotificationsEnabled())
+            AM = autoclass("android.media.AudioManager")
+            am = activity.getSystemService(Context.AUDIO_SERVICE)
+            rm = am.getRingerMode()   # 0静音 1震动 2正常
+            _vib_log("铃声模式: %s" % ("正常" if rm == 2 else
+                                     ("震动" if rm == 1 else "静音")))
+        except Exception as e:
+            _vib_log("诊断异常: %s" % e)
         BuildVer = autoclass("android.os.Build$VERSION")
         # 原生 Notification.Builder —— jnius 里嵌套类要用 $ 访问!
-        # (日志报 "has no attribute 'Builder'" 就是写成 Notification.Builder 了)
         Builder = autoclass("android.app.Notification$Builder")
         if BuildVer.SDK_INT >= 26:
             builder = Builder(activity, "dqls_vib_channel")
@@ -409,47 +462,26 @@ def _vib_notify_vibrate(ms):
             if icon_id and icon_id > 0:
                 builder.setSmallIcon(icon_id)
             else:
-                builder.setSmallIcon(0x01080007)  # android.R.drawable.ic_dialog_info
+                builder.setSmallIcon(0x01080007)
         except Exception:
             builder.setSmallIcon(0x01080007)
         builder.setContentTitle("点球乱射")
-        builder.setContentText("进球!")
-        # 关键: 设波形让系统震动(来电式)
-        builder.setVibrate([0, int(ms), 50, int(ms)])
-        builder.setPriority(2)  # PRIORITY_HIGH
+        builder.setContentText("震动反馈(可忽略)")
+        # API26+ 以通道的波形为准; 旧系统用 setVibrate
+        if BuildVer.SDK_INT < 26:
+            builder.setVibrate([0, int(ms), 50, int(ms)])
+        builder.setPriority(2)
         builder.setAutoCancel(True)
         nm.notify(9991, builder.build())
-        _vib_log("通知震动已发出: ms=%d icon=%s" % (ms, icon_id))
-        # 延迟取消通知(震动已经在系统层触发, cancel 只清通知栏, 免得每次进球都堆一条)
+        _vib_log("通知已发出(通道波形驱动震动): ms=%d" % ms)
+        # 延迟清掉通知栏条目(Runnable 类在模块级只定义一次, 反复点击不再崩)
         try:
             Handler = autoclass("android.os.Handler")
             Looper = autoclass("android.os.Looper")
-
-            class _CancelRunnable(PythonJavaClass):
-                __javainterfaces__ = ['java/lang/Runnable']
-                __javacontext__ = 'app'
-
-                def __init__(self, fn):
-                    super().__init__()
-                    self._fn = fn
-
-                @java_method('()V')
-                def run(self):
-                    try:
-                        self._fn()
-                    except Exception:
-                        pass
-
-            def _do_cancel():
-                try:
-                    nm.cancel(9991)
-                except Exception:
-                    pass
-
             Handler(Looper.getMainLooper()).postDelayed(
-                _CancelRunnable(_do_cancel), 1500)
-        except Exception:
-            pass
+                _VibCancelRunnable(nm), 1500)
+        except Exception as e:
+            _vib_log("延迟取消异常: %s" % e)
         return True
     except Exception as e:
         _vib_log("通知震动失败: %s" % e)
@@ -576,38 +608,13 @@ def _vib_handler_thread():
     return None
 
 
-def _android_vibrate(ms):
-    """安卓马达震动. 成功返回 True, 失败返回 False(并把原因记进 _VIB)."""
+def _vib_via_service(ms):
+    """直接调 Vibrator 系统服务(主路径). 真正驱动马达.
+
+    只需 android.permission.VIBRATE 普通权限(安装即授权, 无需运行弹窗),
+    不依赖通知/勿扰/Android13 运行时通知权限. 成功返回 True, 否则 False.
+    """
     global _vibrator, _vibrate_activity, _vib_disabled
-    if not IS_ANDROID:
-        return False
-    if _vib_disabled:
-        return False
-    try:
-        ms = int(ms)
-    except Exception:
-        ms = 80
-    if ms <= 0:
-        ms = 80
-    _VIB["calls"] += 1
-    _vib_log("=== vibrate 请求 ms=%d ===" % ms)
-
-    # === 路线 A: 通知通道震动(主赌注) ===
-    # 用户反馈"来消息通知都会震", 说明通知通道在系统层放行.
-    # 先建通道+发通知, 让系统原生震动机制驱动马达.
-    try:
-        ok = _vib_notify_vibrate(ms)
-        if ok:
-            _VIB["ok"] += 1
-            _VIB["method"] = "通知通道"
-            _VIB["err"] = "-"
-            _VIB["post"] = "通知"
-            _vib_log("通知通道震动成功")
-            return True
-    except Exception as e:
-        _vib_log("通知通道异常: %s" % e)
-
-    # === 路线 B: Vibrator 直调(备用) ===
     try:
         from jnius import autoclass
         vib = _vibrator
@@ -624,20 +631,14 @@ def _android_vibrate(ms):
                 _VIB["has"] = str(bool(vib.hasVibrator()))
             except Exception:
                 _VIB["has"] = "?"
+            _vib_log("取得 Vibrator: %s hasVibrator=%s" % (how, _VIB["has"]))
 
         timings, amps = _vib_pattern(ms)
-
-        def _ok(how):
-            _VIB["ok"] += 1
-            _VIB["method"] = how
-            _VIB["err"] = "-"
 
         def do_vibrate():
             # 注意 global: 全部失败时要把缓存的 Vibrator 丢掉, 让下一次重新取
             global _vibrator
-            # 记录本轮尝试的所有路径(既是诊断信息, 也确保"成功"不是误报)
             tried = []
-            # 0) 记录 vib 是什么 Java 类 —— 帮助判断我们拿到的到底是 Vibrator 还是别的
             try:
                 tried.append("cls=%s" % vib.getClass().getName())
             except Exception:
@@ -664,8 +665,6 @@ def _android_vibrate(ms):
                     fails.append("%s:%s" % (how, e))
                     return False
 
-            # 准备通知通道 AudioAttributes —— 用户反馈"来消息通知都会震",
-            # 说明通知通路在系统层是放行的. 直接主动震可能被静默拦截.
             attrs = None
             try:
                 Bld = autoclass('android.media.AudioAttributes$Builder')
@@ -675,10 +674,7 @@ def _android_vibrate(ms):
             except Exception as e:
                 tried.append("attrs:%s" % e)
 
-            # 现在六路顺序尝试. 不再"第一个成功就 return" —— 因为之前被认为是"成功"的
-            # 调用其实并没驱动马达, 返回后用户根本没感到. 通知通路 + 显式空对象检查是关键.
             if VibrationEffect is not None:
-                # 1) vibrate(VibrationEffect, AudioAttributes): 单次强震走通知属性
                 if attrs is not None:
                     eff = None
                     try:
@@ -686,10 +682,10 @@ def _android_vibrate(ms):
                     except Exception as e:
                         tried.append("mk1s:%s" % e)
                     if eff is not None:
-                        if try_call("vib(1s+@notif)", lambda: vib.vibrate(eff, attrs)):
+                        if try_call("vib(1s+@notif)",
+                                    lambda: vib.vibrate(eff, attrs)):
                             _VIB["tries"] = "|".join(tried)
                             return
-                # 2) 带振幅波形(不挂通知属性)
                 eff = None
                 try:
                     eff = VibrationEffect.createWaveform(timings, amps, -1)
@@ -699,21 +695,17 @@ def _android_vibrate(ms):
                     if try_call("vib(wave+amp)", lambda: vib.vibrate(eff)):
                         _VIB["tries"] = "|".join(tried)
                         return
-                    # 3) 同时挂通知属性再试一次
                     if attrs is not None and try_call("vib(wave+@notif)",
                                                        lambda: vib.vibrate(eff, attrs)):
                         _VIB["tries"] = "|".join(tried)
                         return
 
-            # 4) 老接口 vibrate(long, AudioAttributes) API21+
             if attrs is not None:
                 if try_call("vibrate(ms+attr)", lambda: vib.vibrate(int(ms), attrs)):
                     _VIB["tries"] = "|".join(tried)
                     return
 
-            # 5) 老接口 vibrate(long ms)
             try_call("vibrate(ms)", lambda: vib.vibrate(int(ms)))
-            # 如果连老接口都"成功"了仍然没动作, 全部丢弃缓存下次重来
             if not _VIB.get("ok", 0):
                 _vibrator = None
                 _vib_err(" | ".join(fails) or "全空对象")
@@ -739,7 +731,6 @@ def _android_vibrate(ms):
             except Exception as e:
                 _vib_err("Handler:%s" % e)
         if not posted:
-            # 再兜底: 自建一个带 Looper 的后台线程
             try:
                 ht = _vib_handler_thread()
                 if ht is not None:
@@ -750,14 +741,69 @@ def _android_vibrate(ms):
             except Exception as e:
                 _vib_err("HandlerThread:%s" % e)
         if not posted:
-            # 实在没有 Looper 入口, 直接试一次(多数情况也能成)
             do_vibrate()
         return True
     except Exception as e:
-        # jnius 完全不可用(理论上不会发生, 因为已打进包), 永久禁用避免每次都报错
-        _vib_disabled = True
-        _vib_err("致命:%s" % e)
+        _vib_log("Vibrator 服务异常: %s" % e)
         return False
+
+
+def _android_vibrate(ms):
+    """安卓马达震动. 成功返回 True, 失败返回 False(并把原因记进 _VIB).
+
+    路径优先级(按可靠性):
+      1) Vibrator 系统服务直调 —— 只需 VIBRATE 普通权限(安装即授权),
+         不依赖通知/勿扰/Android13 运行时通知权限, 这是真正驱动马达的路径.
+      2) 通知通道 —— 兜底; Android13+ 未授权 POST_NOTIFICATIONS 时 notify 被系统
+         静默丢弃, 表现为"显示成功但没震", 故仅作备用.
+    """
+    global _vibrator, _vibrate_activity, _vib_disabled
+    if not IS_ANDROID:
+        return False
+    if _vib_disabled:
+        return False
+    try:
+        ms = int(ms)
+    except Exception:
+        ms = 80
+    if ms <= 0:
+        ms = 80
+    _VIB["calls"] += 1
+    _vib_log("=== vibrate 请求 ms=%d ===" % ms)
+    # 关键诊断: API 版本 + VIBRATE 权限(才是真正控制马达的权限)
+    try:
+        from jnius import autoclass
+        BuildVer = autoclass("android.os.Build$VERSION")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        _VIB["api"] = str(BuildVer.SDK_INT)
+        perm = activity.checkSelfPermission("android.permission.VIBRATE")
+        _vib_log("API=%s VIBRATE 权限=%s(0=已授权)" % (_VIB["api"], perm))
+    except Exception as e:
+        _vib_log("诊断异常: %s" % e)
+
+    # === 主路径: Vibrator 系统服务 ===
+    if _vib_via_service(ms):
+        # 不覆盖 do_vibrate 里已经写好的具体调用方式(如 vib(wave+amp));
+        # 只有它没写时才用笼统的 "Vibrator服务" 兜底.
+        if _VIB.get("method", "-") == "-":
+            _VIB["method"] = "Vibrator服务"
+        _vib_log("Vibrator 服务震动成功(已派发到主线程)")
+        return True
+
+    # === 兜底: 通知通道(可能"显示成功但没震") ===
+    try:
+        ok = _vib_notify_vibrate(ms)
+        if ok:
+            _VIB["ok"] += 1
+            _VIB["method"] = "通知通道"
+            _VIB["post"] = "通知"
+            _vib_log("通知通道震动成功(兜底)")
+            return True
+    except Exception as e:
+        _vib_log("通知通道异常: %s" % e)
+    _vib_err("两种震动路径都失败")
+    return False
 
 
 def vib_status_lines():
@@ -3277,18 +3323,21 @@ class Game:
                 screen.blit(t, (panel_x + 24, y))
                 y += 26
             y += 10
-            # 日志尾部(方便现场看最后几条)
-            tail = _vib_log_lines[-5:] if _vib_log_lines else []
+            # 日志尾部(方便现场截图看最后几条; 真机也可从
+            # Android/data/.../files/vib_debug.log 取完整日志上传)
+            tail = _vib_log_lines[-12:] if _vib_log_lines else []
             if tail:
-                lt = self.font_s.render("最近日志:", True, (180, 200, 230))
+                lt = self.font_s.render("最近日志(也可上传 vib_debug.log):",
+                                        True, (180, 200, 230))
                 screen.blit(lt, (panel_x + 24, y))
                 y += 24
                 for ln in tail:
-                    t = self.font_s.render(ln[:62], True, (170, 190, 210))
+                    t = self.font_s.render(ln[:60], True, (170, 190, 210))
                     screen.blit(t, (panel_x + 24, y))
-                    y += 22
+                    y += 21
             else:
-                t = self.font_s.render("暂无日志", True, (170, 170, 170))
+                t = self.font_s.render("暂无日志(点「测试震动」会产生)",
+                                       True, (170, 170, 170))
                 screen.blit(t, (panel_x + 24, y))
 
         # 按钮: 测试震动 / 清日志 / 返回 (测试震动与清日志仅手机有意义)
@@ -3390,13 +3439,13 @@ class Game:
     _PTEST_S_PRESETS = ["兔同笼", "只因兔", "重炮手", "快腿", "鹰眼", "Q版9"]
     _PTEST_K_PRESETS = ["铁门神", "墙上盾", "灵猫", "老帅", "门神", "捕手K"]
 
-    # 三列按钮布局: 每项一行, 左"-"右"+"
+    # 三列按钮布局: 每项一行, 左"-"右"+"(v1.17 加大: 88x60, 更好点)
     def _ptest_row_rects(self, col_x, row_y):
         """返回某列某行的 (-按钮, 数值区, +按钮)."""
-        bw, bh = 64, 52
+        bw, bh = 88, 60
         minus = (col_x, row_y, bw, bh)
-        val = (col_x + bw + 14, row_y, 150, bh)
-        plus = (col_x + bw + 14 + 150 + 14, row_y, bw, bh)
+        val = (col_x + bw + 12, row_y, 140, bh)
+        plus = (col_x + bw + 12 + 140 + 12, row_y, bw, bh)
         return minus, val, plus
 
     # 进攻方 3 项 / 防守方 3 项, 各占一列
@@ -3637,18 +3686,99 @@ class Game:
                                        len(KEEPERS) - 1)
         self._ptest_msg = "  ".join(msgs)
 
+    def _ptest_start_edit(self, which):
+        """进入名字编辑态, 并尝试唤起手机软键盘.
+
+        两条路径都试, 且都写日志, 便于真机定位"手机输入法点不出来"的根因:
+          1) SDL start_text_input (pygame_sdl2 映射到 SDL_StartTextInput)
+          2) JNI 直接让 Android InputMethodManager 强制显示(兜底)
+        """
+        self._ptest_editing = which
+        rect = (self._ptest_sname_rect() if which == "s"
+                else self._ptest_kname_rect())
+        # 路径 1: SDL 文本输入
+        try:
+            has = hasattr(pygame.key, "start_text_input")
+            _vib_log("[NAME] 编辑(%s): start_text_input 可用=%s" % (which, has))
+            if has:
+                if not pygame.key.get_start_text_input():
+                    pygame.key.start_text_input()
+                pygame.key.set_text_input_rect(rect)
+                _vib_log("[NAME] 编辑(%s): 已调用 SDL start_text_input" % which)
+        except Exception as e:
+            _vib_log("[NAME] 编辑(%s): SDL 键盘异常 %s" % (which, e))
+        # 路径 2: JNI 兜底 —— 直接让 Android 显示输入法(即使 SDL 路径没生效也拉得起来)
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            Ctx = autoclass("android.content.Context")
+            imm = activity.getSystemService(Ctx.INPUT_METHOD_SERVICE)
+            IMM = autoclass("android.view.inputmethod.InputMethodManager")
+            view = activity.getWindow().getDecorView()
+            imm.showSoftInput(view, IMM.SHOW_FORCED)
+            _vib_log("[NAME] 编辑(%s): JNI showSoftInput 已调用" % which)
+        except Exception as e:
+            _vib_log("[NAME] 编辑(%s): JNI 键盘异常 %s" % (which, e))
+
+    def _ptest_which(self, pos):
+        """只判断点中了哪个区域(只读, 不改数值), 用于诊断日志."""
+        if self._point_in_rect(pos, self._ptest_sname_rect()):
+            return "名字(射)"
+        if self._point_in_rect(pos, self._ptest_kname_rect()):
+            return "名字(门)"
+        if self._point_in_rect(pos, self._ptest_srand_rect()):
+            return "随机(射)"
+        if self._point_in_rect(pos, self._ptest_krand_rect()):
+            return "随机(门)"
+        if self._point_in_rect(pos, self._ptest_toggle_rect()):
+            return "开关"
+        for col_x, _s, rows in (
+                (WIDTH // 2 - 560 + 30, None, self._PTEST_STRIKER_ROWS),
+                (WIDTH // 2 + 40 + 30, None, self._PTEST_KEEPER_ROWS)):
+            y = 108 + 170
+            for _k, _l in rows:
+                minus, _v, plus = self._ptest_row_rects(col_x, y)
+                if self._point_in_rect(pos, minus):
+                    return "减号"
+                if self._point_in_rect(pos, plus):
+                    return "加号"
+                y += 78
+        if self._point_in_rect(pos, self._ptest_gen_rect()):
+            return "应用"
+        if self._point_in_rect(pos, self._ptest_back_rect()):
+            return "返回"
+        return "空白"
+
+    def _ptest_stop_edit(self):
+        """退出编辑态并关闭软键盘."""
+        self._ptest_editing = None
+        try:
+            if pygame.key.get_start_text_input():
+                pygame.key.stop_text_input()
+        except Exception:
+            pass
+
     def _handle_player_test(self, ev):
         editing = getattr(self, "_ptest_editing", None)
+        # 手机输入法: SDL 文本输入事件(TEXTINPUT), 每次带一小段文本(拼音上屏)
+        if ev.type == getattr(pygame, "TEXTINPUT", -99) and editing in ("s", "k"):
+            txt = getattr(ev, "text", "") or ""
+            _vib_log("[NAME] 收到 TEXTINPUT text=%r 编辑=%s" % (txt, editing))
+            for ch in txt:
+                self._ptest_append_name(editing, ch)
+            return
         if ev.type == pygame.KEYDOWN:
             if editing in ("s", "k"):
-                # 名字编辑态: 键盘输入, 回车确认, 退格删除, ESC取消编辑
+                # 名字编辑态: 桌面键盘走 KEYDOWN.unicode 兜底, 回车确认, 退格删除
                 if ev.key == pygame.K_RETURN:
-                    self._ptest_editing = None
+                    self._ptest_stop_edit()
                 elif ev.key == pygame.K_BACKSPACE:
                     self._ptest_backspace(editing)
                 elif ev.key == pygame.K_ESCAPE:
-                    self._ptest_editing = None
+                    self._ptest_stop_edit()
                 elif ev.unicode and ev.unicode.isprintable():
+                    # TEXTINPUT 已处理输入的场合不会到这里(桌面端用它兜底)
                     self._ptest_append_name(editing, ev.unicode)
                 return
             if ev.key in (pygame.K_ESCAPE,):
@@ -3657,27 +3787,31 @@ class Game:
             elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self._ptest_generate()
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            # 先点名字框进入编辑态
+            # 诊断: 记录每次点击的坐标与命中区域, 便于真机定位"加减号/名字点不动"
+            _vib_log("[PTEST] 点击 pos=%s 命中=%s 编辑中=%s"
+                     % (tuple(int(p) for p in ev.pos),
+                        self._ptest_which(ev.pos), editing))
+            # 先点名字框进入编辑态(并唤起手机输入法)
             if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
-                self._ptest_editing = "s"
+                self._ptest_start_edit("s")
                 return
             if self._point_in_rect(ev.pos, self._ptest_kname_rect()):
-                self._ptest_editing = "k"
+                self._ptest_start_edit("k")
                 return
             if self._point_in_rect(ev.pos, self._ptest_srand_rect()):
                 import random as _r
                 self._tester_s_name = _r.choice(self._PTEST_S_PRESETS)
-                self._ptest_editing = None
+                self._ptest_stop_edit()
                 return
             if self._point_in_rect(ev.pos, self._ptest_krand_rect()):
                 import random as _r
                 self._tester_k_name = _r.choice(self._PTEST_K_PRESETS)
-                self._ptest_editing = None
+                self._ptest_stop_edit()
                 return
             # 开关: 是 <-> 否 (即时生效: 是=加入, 否=移除)
             if self._point_in_rect(ev.pos, self._ptest_toggle_rect()):
                 self._tester_on = not self._ptest_enabled()
-                self._ptest_editing = None
+                self._ptest_stop_edit()
                 self._ptest_generate()
                 return
             if self._ptest_click_row(ev.pos):
@@ -3686,6 +3820,7 @@ class Game:
                 self._ptest_generate()
                 return
             if self._point_in_rect(ev.pos, self._ptest_back_rect()):
+                self._ptest_stop_edit()
                 self.state = State.DEV
                 self.state_t = 0.0
 
@@ -4311,9 +4446,9 @@ class Game:
         于是游戏把同一次点击处理了两遍: 先选中射手并立刻确认 -> 跳到选门将,
         紧接着第二次事件又在当前界面上生效 —— 表现为"点了没反应/选不了人"。
 
-        这里把 0.08 秒内、位置几乎相同的第二次按下判为重复并丢弃。
-        (v1.16: 0.35 -> 0.08 —— SDL 双投递两次事件间隔只有几毫秒, 0.08s 足够挡住;
-         之前 0.35s 会把玩家"快速连点同一个按钮"的真实第二击吞掉, 表现为点了没反应。)
+        这里把 0.03 秒内、位置几乎相同的第二次按下判为重复并丢弃。
+        (v1.17: 0.08 -> 0.03 —— SDL 双投递两次事件间隔只有几毫秒, 0.03s 足够挡住;
+         之前 0.08s 仍会把玩家"快速连点同一个按钮"的真实第二击吞掉, 表现为点了没反应。)
         """
         try:
             now = time.time()
@@ -4321,7 +4456,9 @@ class Game:
         except Exception:
             return True
         lx, ly = self._last_tap_pos
-        if (now - self._last_tap_t < 0.08 and
+        # 窗口收紧到 0.03s: SDL 双投递两次事件间隔只有几毫秒, 足以挡掉;
+        # 真人"快速连点同一个按钮"通常是 100ms+, 不会被误吞(之前 0.08s 仍可能吞掉狂点).
+        if (now - self._last_tap_t < 0.03 and
                 abs(px - lx) < 60 and abs(py - ly) < 60):
             return False
         self._last_tap_t = now
