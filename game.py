@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.15"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.16"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -142,6 +142,9 @@ GOAL_Z = 11.0                          # 球门线z
 NET_DEPTH = 1.6                        # 球网深度
 PENALTY_Z = 2.0                        # 点球点
 KEEPER_Z = 10.2                        # 守门员初始位置
+# 主菜单项数量: 开始比赛 / 操作说明 / 开发者模块 / 退出游戏
+# (v1.16 修复: 之前误定义在 State 类里, Game 方法里访问不到 -> NameError 闪退)
+MENU_ITEM_COUNT = 4
 
 # 颜色(FC足球世界风格 - 明亮饱和)
 SKY_TOP = (96, 165, 235)
@@ -1103,8 +1106,7 @@ class State(Enum):
     MENU = auto()
     HELP = auto()                # 操作说明页面
     DEV = auto()                 # 开发者模块(震动自检/日志等诊断内容)
-    # 菜单项数量: 开始比赛 / 操作说明 / 开发者模块 / 退出游戏
-    MENU_ITEM_COUNT = 4
+    PLAYER_TEST = auto()         # 球员测试(自建角色 -> 加入选卡第5/6张)
     SELECT_STRIKER = auto()
     SELECT_KEEPER = auto()
     READY = auto()              # 准备阶段(显示轮次/攻守)
@@ -1799,6 +1801,8 @@ class Game:
             self._handle_help(ev)
         elif self.state == State.DEV:
             self._handle_dev(ev)
+        elif self.state == State.PLAYER_TEST:
+            self._handle_player_test(ev)
         elif self.state == State.SELECT_STRIKER:
             self._handle_select_striker(ev)
         elif self.state == State.SELECT_KEEPER:
@@ -1864,8 +1868,12 @@ class Game:
         手机上看着"点了没反应" —— 这里收窄到总宽 1170, 四张都完整可见可点。
         """
         n = len(STRIKERS)
-        card_w, card_h = 270, 500
-        gap = 30
+        # 自适应: 5张卡时收窄卡宽, 保证全部完整可见(不溢出画面)
+        gap = 30 if n <= 4 else 18
+        margin = 20
+        avail = WIDTH - margin * 2
+        card_w = min(270, (avail - (n - 1) * gap) // n)
+        card_h = 500
         total_w = n * card_w + (n - 1) * gap
         start_x = (WIDTH - total_w) // 2
         x = start_x + i * (card_w + gap)
@@ -1897,8 +1905,12 @@ class Game:
     def _keeper_card_rect(self, i):
         """返回守门员卡片i的矩形."""
         n = len(KEEPERS)
-        card_w, card_h = 220, 420
+        # 自适应: 6张卡时收窄卡宽, 保证全部完整可见
         gap = 18
+        margin = 16
+        avail = WIDTH - margin * 2
+        card_w = min(220, (avail - (n - 1) * gap) // n)
+        card_h = 420
         total_w = n * card_w + (n - 1) * gap
         start_x = (WIDTH - total_w) // 2
         x = start_x + i * (card_w + gap)
@@ -3062,6 +3074,8 @@ class Game:
             self._draw_help(screen)
         elif self.state == State.DEV:
             self._draw_dev(screen)
+        elif self.state == State.PLAYER_TEST:
+            self._draw_player_test(screen)
         elif self.state == State.SELECT_STRIKER:
             self._draw_select_striker(screen)
         elif self.state == State.SELECT_KEEPER:
@@ -3277,28 +3291,32 @@ class Game:
                 t = self.font_s.render("暂无日志", True, (170, 170, 170))
                 screen.blit(t, (panel_x + 24, y))
 
-        # 按钮: 测试震动 / 清日志 / 返回
-        if IS_ANDROID:
-            r1 = self._dev_vib_rect()
-            h1 = self._point_in_rect(self.mouse_pos, r1)
-            self._draw_button(screen, r1, "测试震动", hover=h1, active=h1)
-            r2 = self._dev_clear_rect()
-            h2 = self._point_in_rect(self.mouse_pos, r2)
-            self._draw_button(screen, r2, "清日志", hover=h2)
-            r3 = self._dev_back_rect()
-        else:
-            r3 = self._button_rect(WIDTH // 2, HEIGHT - 60, 220, 46)
+        # 按钮: 测试震动 / 清日志 / 返回 (测试震动与清日志仅手机有意义)
+        r1 = self._dev_vib_rect()
+        h1 = self._point_in_rect(self.mouse_pos, r1)
+        self._draw_button(screen, r1, "测试震动", hover=h1, active=h1)
+        r2 = self._dev_clear_rect()
+        h2 = self._point_in_rect(self.mouse_pos, r2)
+        self._draw_button(screen, r2, "清日志", hover=h2)
+        # 球员测试入口(桌面/手机都可用)
+        rp = self._dev_ptest_rect()
+        hp = self._point_in_rect(self.mouse_pos, rp)
+        self._draw_button(screen, rp, "球员测试", hover=hp, active=hp)
+        r3 = self._dev_back_rect()
         h3 = self._point_in_rect(self.mouse_pos, r3)
         self._draw_button(screen, r3, "返回菜单", hover=h3)
 
     def _dev_vib_rect(self):
-        return self._button_rect(WIDTH // 2 - 250, HEIGHT - 60, 220, 46)
+        return self._button_rect(WIDTH // 2 - 320, HEIGHT - 60, 200, 46)
 
     def _dev_clear_rect(self):
-        return self._button_rect(WIDTH // 2, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 - 105, HEIGHT - 60, 190, 46)
+
+    def _dev_ptest_rect(self):
+        return self._button_rect(WIDTH // 2 + 110, HEIGHT - 60, 200, 46)
 
     def _dev_back_rect(self):
-        return self._button_rect(WIDTH // 2 + 250, HEIGHT - 60, 220, 46)
+        return self._button_rect(WIDTH // 2 + 330, HEIGHT - 60, 200, 46)
 
     def _handle_dev(self, ev):
         if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE,
@@ -3312,8 +3330,363 @@ class Game:
             if IS_ANDROID and self._point_in_rect(ev.pos, self._dev_clear_rect()):
                 _vib_log_lines.clear()
                 return
+            # 球员测试: 桌面/手机都可用(开发者工具, 不限平台)
+            if self._point_in_rect(ev.pos, self._dev_ptest_rect()):
+                self.state = State.PLAYER_TEST
+                self.state_t = 0.0
+                return
             if self._point_in_rect(ev.pos, self._dev_back_rect()):
                 self.state = State.MENU
+                self.state_t = 0.0
+
+    # ----- 球员测试(自建角色 -> 选卡界面第5射手/第6门将) -----
+    # 数值直接存在 Game 实例上(进页面就能改, 生成后立即生效)
+    def _ptest_striker_stats(self):
+        if not hasattr(self, "_tester_striker"):
+            self._tester_striker = {"power": 7, "accuracy": 7, "composure": 7}
+        return self._tester_striker
+
+    def _ptest_keeper_stats(self):
+        if not hasattr(self, "_tester_keeper"):
+            self._tester_keeper = {"reflex": 8, "reach": 8, "dive": 8}
+        return self._tester_keeper
+
+    def _ptest_enabled(self):
+        """自建卡是否加入选卡(默认否 —— 只有这里选'是'才出现第5/6张)."""
+        return getattr(self, "_tester_on", False)
+
+    def _ptest_sname(self):
+        if not hasattr(self, "_tester_s_name"):
+            self._tester_s_name = "自建射手"
+        return self._tester_s_name
+
+    def _ptest_kname(self):
+        if not hasattr(self, "_tester_k_name"):
+            self._tester_k_name = "自建门将"
+        return self._tester_k_name
+
+    @staticmethod
+    def _name_disp_width(name):
+        """名字显示宽度: 汉字=2, 其他=1, 上限8(即最多4个汉字/8个字母)."""
+        return sum(2 if ord(ch) > 127 else 1 for ch in name)
+
+    def _ptest_append_name(self, which, ch):
+        """往名字里追加一个字符(超出宽度上限则忽略). which: 's'/'k'."""
+        cur = self._ptest_sname() if which == "s" else self._ptest_kname()
+        if self._name_disp_width(cur + ch) <= 8:
+            if which == "s":
+                self._tester_s_name = cur + ch
+            else:
+                self._tester_k_name = cur + ch
+
+    def _ptest_backspace(self, which):
+        cur = self._ptest_sname() if which == "s" else self._ptest_kname()
+        if cur:
+            if which == "s":
+                self._tester_s_name = cur[:-1]
+            else:
+                self._tester_k_name = cur[:-1]
+
+    _PTEST_S_PRESETS = ["兔同笼", "只因兔", "重炮手", "快腿", "鹰眼", "Q版9"]
+    _PTEST_K_PRESETS = ["铁门神", "墙上盾", "灵猫", "老帅", "门神", "捕手K"]
+
+    # 三列按钮布局: 每项一行, 左"-"右"+"
+    def _ptest_row_rects(self, col_x, row_y):
+        """返回某列某行的 (-按钮, 数值区, +按钮)."""
+        bw, bh = 64, 52
+        minus = (col_x, row_y, bw, bh)
+        val = (col_x + bw + 14, row_y, 150, bh)
+        plus = (col_x + bw + 14 + 150 + 14, row_y, bw, bh)
+        return minus, val, plus
+
+    # 进攻方 3 项 / 防守方 3 项, 各占一列
+    _PTEST_STRIKER_ROWS = [("power", "力量"), ("accuracy", "准度"),
+                           ("composure", "心理")]
+    _PTEST_KEEPER_ROWS = [("reflex", "反应"), ("reach", "臂展"),
+                          ("dive", "扑救")]
+
+    def _draw_player_test(self, screen):
+        self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
+        title = self.font_l.render("球员测试 - 铸造新角色", True, WHITE)
+        screen.blit(title, (WIDTH // 2 - 260 - title.get_width() // 2, 24))
+        # 启用开关: 只有选"是"才把自建卡加进选卡界面
+        on = self._ptest_enabled()
+        rt = self._ptest_toggle_rect()
+        ht = self._point_in_rect(self.mouse_pos, rt)
+        self._draw_button(screen, rt,
+                          "加入选卡: %s" % ("是" if on else "否"),
+                          hover=ht, active=on)
+        sub = self.font_s.render(
+            "开关选「是」才出现第5/6张卡; 名字上限8字母(4汉字); 数值1~10",
+            True, (215, 225, 235))
+        screen.blit(sub, (WIDTH // 2 - sub.get_width() // 2, 66))
+
+        panel_y, panel_h = 108, 470
+        # 左: 进攻方
+        lx, lw = WIDTH // 2 - 560, 520
+        pygame.draw.rect(screen, PANEL, (lx, panel_y, lw, panel_h), border_radius=14)
+        pygame.draw.rect(screen, (220, 120, 60), (lx, panel_y, lw, panel_h), 2,
+                         border_radius=14)
+        t1 = self.font_m.render("进攻方(射手)", True, (255, 200, 140))
+        screen.blit(t1, (lx + lw // 2 - t1.get_width() // 2, panel_y + 12))
+        cur = getattr(self, "_tester_striker_obj", None)
+        note = ("卡上名字: %s" % cur.name) if cur else "未加入选卡(开关选是)"
+        nt = self.font_s.render(note, True,
+                                (140, 230, 150) if cur else (170, 170, 170))
+        screen.blit(nt, (lx + lw // 2 - nt.get_width() // 2, panel_y + 44))
+        # 名字编辑行
+        editing = getattr(self, "_ptest_editing", None)
+        nb = self._ptest_sname_rect()
+        active_s = (editing == "s")
+        pygame.draw.rect(screen, (60, 60, 70), nb, border_radius=8)
+        pygame.draw.rect(screen, GOLD if active_s else (110, 110, 120), nb,
+                         2 if active_s else 1, border_radius=8)
+        nm = self._ptest_sname()
+        show_nm = nm + ("_" if active_s and (pygame.time.get_ticks() // 400) % 2 == 0 else "")
+        nt2 = self.font_m.render(show_nm, True, WHITE)
+        screen.blit(nt2, (nb[0] + 12, nb[1] + nb[3] // 2 - nt2.get_height() // 2))
+        nlab = self.font_s.render("名字", True, (200, 200, 200))
+        screen.blit(nlab, (lx + 30, nb[1] + nb[3] // 2 - nlab.get_height() // 2))
+        rr = self._ptest_srand_rect()
+        hr = self._point_in_rect(self.mouse_pos, rr)
+        self._draw_button(screen, rr, "随机名", hover=hr)
+        # 数值行(下移, 给名字行让位)
+        y = panel_y + 170
+        for key, label in self._PTEST_STRIKER_ROWS:
+            v = self._ptest_striker_stats()[key]
+            minus, val, plus = self._ptest_row_rects(lx + 30, y)
+            hm = self._point_in_rect(self.mouse_pos, minus)
+            hp = self._point_in_rect(self.mouse_pos, plus)
+            self._draw_button(screen, minus, "-", hover=hm, active=hm)
+            self._draw_button(screen, plus, "+", hover=hp, active=hp)
+            vt = self.font_l.render("%s %d" % (label, v), True, WHITE)
+            screen.blit(vt, (val[0] + val[2] // 2 - vt.get_width() // 2,
+                             val[1] + val[3] // 2 - vt.get_height() // 2))
+            y += 78
+
+        # 右: 防守方
+        rx = WIDTH // 2 + 40
+        pygame.draw.rect(screen, PANEL, (rx, panel_y, lw, panel_h), border_radius=14)
+        pygame.draw.rect(screen, (90, 160, 220), (rx, panel_y, lw, panel_h), 2,
+                         border_radius=14)
+        t2 = self.font_m.render("防守方(门将)", True, (150, 210, 255))
+        screen.blit(t2, (rx + lw // 2 - t2.get_width() // 2, panel_y + 12))
+        cur_k = getattr(self, "_tester_keeper_obj", None)
+        note = ("卡上名字: %s" % cur_k.name) if cur_k else "未加入选卡(开关选是)"
+        nt = self.font_s.render(note, True,
+                                (140, 230, 150) if cur_k else (170, 170, 170))
+        screen.blit(nt, (rx + lw // 2 - nt.get_width() // 2, panel_y + 44))
+        nb2 = self._ptest_kname_rect()
+        active_k = (editing == "k")
+        pygame.draw.rect(screen, (60, 60, 70), nb2, border_radius=8)
+        pygame.draw.rect(screen, GOLD if active_k else (110, 110, 120), nb2,
+                         2 if active_k else 1, border_radius=8)
+        nm2 = self._ptest_kname()
+        show_nm2 = nm2 + ("_" if active_k and (pygame.time.get_ticks() // 400) % 2 == 0 else "")
+        nt3 = self.font_m.render(show_nm2, True, WHITE)
+        screen.blit(nt3, (nb2[0] + 12, nb2[1] + nb2[3] // 2 - nt3.get_height() // 2))
+        nlab2 = self.font_s.render("名字", True, (200, 200, 200))
+        screen.blit(nlab2, (rx + 30, nb2[1] + nb2[3] // 2 - nlab2.get_height() // 2))
+        rr2 = self._ptest_krand_rect()
+        hr2 = self._point_in_rect(self.mouse_pos, rr2)
+        self._draw_button(screen, rr2, "随机名", hover=hr2)
+        y = panel_y + 170
+        for key, label in self._PTEST_KEEPER_ROWS:
+            v = self._ptest_keeper_stats()[key]
+            minus, val, plus = self._ptest_row_rects(rx + 30, y)
+            hm = self._point_in_rect(self.mouse_pos, minus)
+            hp = self._point_in_rect(self.mouse_pos, plus)
+            self._draw_button(screen, minus, "-", hover=hm, active=hm)
+            self._draw_button(screen, plus, "+", hover=hp, active=hp)
+            vt = self.font_l.render("%s %d" % (label, v), True, WHITE)
+            screen.blit(vt, (val[0] + val[2] // 2 - vt.get_width() // 2,
+                             val[1] + val[3] // 2 - vt.get_height() // 2))
+            y += 78
+
+        # 底部按钮: 应用 / 返回
+        rg = self._ptest_gen_rect()
+        hg = self._point_in_rect(self.mouse_pos, rg)
+        self._draw_button(screen, rg,
+                          "应用(按当前数值/名字)" if on else "应用(先打开右上开关)",
+                          hover=hg, active=hg)
+        rb = self._ptest_back_rect()
+        hb = self._point_in_rect(self.mouse_pos, rb)
+        self._draw_button(screen, rb, "返回", hover=hb)
+        msg = getattr(self, "_ptest_msg", "")
+        if msg:
+            mt = self.font_s.render(msg, True, (150, 235, 150))
+            screen.blit(mt, (WIDTH // 2 - mt.get_width() // 2, HEIGHT - 118))
+
+    def _ptest_toggle_rect(self):
+        return self._button_rect(WIDTH - 250, 24, 230, 44)
+
+    def _ptest_sname_rect(self):
+        return (WIDTH // 2 - 560 + 110, 108 + 84, 240, 52)
+
+    def _ptest_kname_rect(self):
+        return (WIDTH // 2 + 40 + 110, 108 + 84, 240, 52)
+
+    def _ptest_srand_rect(self):
+        nb = self._ptest_sname_rect()
+        return (nb[0] + nb[2] + 12, nb[1], 110, nb[3])
+
+    def _ptest_krand_rect(self):
+        nb = self._ptest_kname_rect()
+        return (nb[0] + nb[2] + 12, nb[1], 110, nb[3])
+
+    def _ptest_gen_rect(self):
+        return self._button_rect(WIDTH // 2 - 130, HEIGHT - 56, 250, 48)
+
+    def _ptest_back_rect(self):
+        return self._button_rect(WIDTH // 2 + 170, HEIGHT - 56, 200, 48)
+
+    def _ptest_click_row(self, pos):
+        """处理 +/- 点击. 返回 True 表示点中了某个按钮."""
+        hit = False
+        for col_x, stats, rows in (
+                (WIDTH // 2 - 560 + 30, self._ptest_striker_stats(),
+                 self._PTEST_STRIKER_ROWS),
+                (WIDTH // 2 + 40 + 30, self._ptest_keeper_stats(),
+                 self._PTEST_KEEPER_ROWS)):
+            y = 108 + 170   # 与 _draw_player_test 的数值行起点一致
+            for key, _label in rows:
+                minus, val, plus = self._ptest_row_rects(col_x, y)
+                if self._point_in_rect(pos, minus):
+                    stats[key] = max(1, stats[key] - 1)
+                    hit = True
+                elif self._point_in_rect(pos, plus):
+                    stats[key] = min(10, stats[key] + 1)
+                    hit = True
+                y += 78
+            if hit:
+                return True
+        return hit
+
+    def _ptest_generate(self):
+        """按开关应用自建角色:
+        开关"是" -> 射手加入 STRIKERS 第5张, 门将加入 KEEPERS 第6张(名字用自定义);
+        开关"否" -> 从选卡移除自建卡, 恢复原定角色."""
+        # 名字兜底: 空名用默认
+        if not self._ptest_sname().strip():
+            self._tester_s_name = "自建射手"
+        if not self._ptest_kname().strip():
+            self._tester_k_name = "自建门将"
+        if not self._ptest_enabled():
+            removed = False
+            if any(p.key == "custom" for p in STRIKERS):
+                STRIKERS[:] = [p for p in STRIKERS if p.key != "custom"]
+                removed = True
+            if any(p.key == "custom" for p in KEEPERS):
+                KEEPERS[:] = [p for p in KEEPERS if p.key != "custom"]
+                removed = True
+            self._tester_striker_obj = None
+            self._tester_keeper_obj = None
+            self._card_cache.clear()
+            self.selected_striker_idx = min(self.selected_striker_idx,
+                                            len(STRIKERS) - 1)
+            self.selected_keeper_idx = min(self.selected_keeper_idx,
+                                           len(KEEPERS) - 1)
+            self._ptest_msg = "已移出自建卡, 恢复原定角色" if removed \
+                else "开关为否: 选卡保持原定角色"
+            return
+        s = self._ptest_striker_stats()
+        k = self._ptest_keeper_stats()
+        msgs = []
+        # --- 射手: 固定占第5张(索引4) ---
+        cst = StrikerProfile(
+            "custom", self._ptest_sname(),
+            power=int(s["power"]), accuracy=int(s["accuracy"]),
+            composure=int(s["composure"]),
+            color=(250, 180, 60), skin=(232, 198, 160),
+            desc="球员测试铸造: 力量%d/准度%d/心理%d" % (
+                s["power"], s["accuracy"], s["composure"]),
+            skill="none", skill_name="无技能",
+            skill_desc="无特殊技能, 数值由开发者自定",
+        )
+        if len(STRIKERS) >= 5 and STRIKERS[4].key == "custom":
+            STRIKERS[4] = cst
+            msgs.append("射手已更新(第5张)")
+        else:
+            STRIKERS.append(cst)
+            msgs.append("射手已加入(第5张)")
+        self._tester_striker_obj = cst
+        # --- 门将: 固定占第6张(索引5) ---
+        ckp = KeeperProfile(
+            "custom", self._ptest_kname(),
+            reflex=int(k["reflex"]), reach=int(k["reach"]), dive=int(k["dive"]),
+            color=(120, 190, 240), skin=(230, 196, 158),
+            desc="球员测试铸造: 反应%d/臂展%d/扑救%d" % (
+                k["reflex"], k["reach"], k["dive"]),
+            skill="none", skill_name="无技能",
+            skill_desc="无特殊技能, 数值由开发者自定",
+        )
+        if len(KEEPERS) >= 6 and KEEPERS[5].key == "custom":
+            KEEPERS[5] = ckp
+            msgs.append("门将已更新(第6张)")
+        else:
+            KEEPERS.append(ckp)
+            msgs.append("门将已加入(第6张)")
+        self._tester_keeper_obj = ckp
+        # 卡片缓存全部失效(尺寸/内容都可能变)
+        self._card_cache.clear()
+        # 防止选中索引越界
+        self.selected_striker_idx = min(self.selected_striker_idx,
+                                        len(STRIKERS) - 1)
+        self.selected_keeper_idx = min(self.selected_keeper_idx,
+                                       len(KEEPERS) - 1)
+        self._ptest_msg = "  ".join(msgs)
+
+    def _handle_player_test(self, ev):
+        editing = getattr(self, "_ptest_editing", None)
+        if ev.type == pygame.KEYDOWN:
+            if editing in ("s", "k"):
+                # 名字编辑态: 键盘输入, 回车确认, 退格删除, ESC取消编辑
+                if ev.key == pygame.K_RETURN:
+                    self._ptest_editing = None
+                elif ev.key == pygame.K_BACKSPACE:
+                    self._ptest_backspace(editing)
+                elif ev.key == pygame.K_ESCAPE:
+                    self._ptest_editing = None
+                elif ev.unicode and ev.unicode.isprintable():
+                    self._ptest_append_name(editing, ev.unicode)
+                return
+            if ev.key in (pygame.K_ESCAPE,):
+                self.state = State.DEV
+                self.state_t = 0.0
+            elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self._ptest_generate()
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            # 先点名字框进入编辑态
+            if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
+                self._ptest_editing = "s"
+                return
+            if self._point_in_rect(ev.pos, self._ptest_kname_rect()):
+                self._ptest_editing = "k"
+                return
+            if self._point_in_rect(ev.pos, self._ptest_srand_rect()):
+                import random as _r
+                self._tester_s_name = _r.choice(self._PTEST_S_PRESETS)
+                self._ptest_editing = None
+                return
+            if self._point_in_rect(ev.pos, self._ptest_krand_rect()):
+                import random as _r
+                self._tester_k_name = _r.choice(self._PTEST_K_PRESETS)
+                self._ptest_editing = None
+                return
+            # 开关: 是 <-> 否 (即时生效: 是=加入, 否=移除)
+            if self._point_in_rect(ev.pos, self._ptest_toggle_rect()):
+                self._tester_on = not self._ptest_enabled()
+                self._ptest_editing = None
+                self._ptest_generate()
+                return
+            if self._ptest_click_row(ev.pos):
+                return
+            if self._point_in_rect(ev.pos, self._ptest_gen_rect()):
+                self._ptest_generate()
+                return
+            if self._point_in_rect(ev.pos, self._ptest_back_rect()):
+                self.state = State.DEV
                 self.state_t = 0.0
 
     def _draw_early_end_popup(self, screen):
@@ -3449,7 +3822,8 @@ class Game:
             x, y, card_w, card_h = self._striker_card_rect(i)
             sel = (i == self.selected_striker_idx)
             screen.blit(self._cached_card(
-                ("S", i, sel), card_w, card_h,
+                # key 带上 card_w: 自建角色加入后卡宽变化, 旧缓存必须失效
+                ("S", i, sel, card_w), card_w, card_h,
                 lambda s, i=i, sp=sp, sel=sel: self._draw_player_card(
                     s, 0, 0, card_w, card_h, sp.name,
                     [("力量", sp.power), ("准度", sp.accuracy),
@@ -3476,7 +3850,7 @@ class Game:
             save_power = (kp.reflex * 0.4 + kp.dive * 0.6) / 10.0
             sp_color = GREEN if save_power >= 0.55 else RED
             screen.blit(self._cached_card(
-                ("K", i, sel), card_w, card_h,
+                ("K", i, sel, card_w), card_w, card_h,
                 lambda s, i=i, kp=kp, sel=sel: self._draw_player_card(
                     s, 0, 0, card_w, card_h, kp.name,
                     [("反应", kp.reflex), ("臂展", kp.reach),
@@ -3937,8 +4311,9 @@ class Game:
         于是游戏把同一次点击处理了两遍: 先选中射手并立刻确认 -> 跳到选门将,
         紧接着第二次事件又在当前界面上生效 —— 表现为"点了没反应/选不了人"。
 
-        这里把 0.35 秒内、位置几乎相同的第二次按下判为重复并丢弃。
-        桌面端两次真实点击间隔一般都大于 0.35 秒, 不受影响。
+        这里把 0.08 秒内、位置几乎相同的第二次按下判为重复并丢弃。
+        (v1.16: 0.35 -> 0.08 —— SDL 双投递两次事件间隔只有几毫秒, 0.08s 足够挡住;
+         之前 0.35s 会把玩家"快速连点同一个按钮"的真实第二击吞掉, 表现为点了没反应。)
         """
         try:
             now = time.time()
@@ -3946,7 +4321,7 @@ class Game:
         except Exception:
             return True
         lx, ly = self._last_tap_pos
-        if (now - self._last_tap_t < 0.35 and
+        if (now - self._last_tap_t < 0.08 and
                 abs(px - lx) < 60 and abs(py - ly) < 60):
             return False
         self._last_tap_t = now
