@@ -12,7 +12,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt,debug.keystore
 
 # 版本(与 game.py 的 VERSION 常量保持一致)
-version = 1.12
+version = 1.13
 
 # 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
 # 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
@@ -53,7 +53,7 @@ android.api = 33
 # 必须 >= 24: Python 3.14 的 remote_debugging 用到 preadv/pwritev,
 # bionic 从 API 24 才提供, minapi=23 时会报 "call to undeclared function" 硬错误
 android.minapi = 24
-android.permissions = VIBRATE
+android.permissions = VIBRATE,POST_NOTIFICATIONS
 android.allow_backup = True
 # 固定签名: 用仓库内置的 debug.keystore 签名, 保证新版本可直接"覆盖安装",
 # 不必先卸载旧版(否则 CI 每次用随机 keystore 会导致签名不一致, 安装被拒).
