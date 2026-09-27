@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.17"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.18"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -1243,6 +1243,22 @@ class Game:
         self._win_w, self._win_h = self._window_size()
         pygame.display.set_caption(f"{APP_NAME} v{VERSION} - 3D 点球大战")
         self.clock = pygame.time.Clock()
+
+        # 恢复上次「球员测试」自建角色(名字/数值/开关)—— 见 _ptest_load_config
+        try:
+            self._ptest_load_config()
+        except Exception:
+            pass
+
+        # 触摸输入管线状态(见 handle_event):
+        # 手机端 SDL 把一次触摸同时送成 FINGERDOWN 和"合成的" MOUSEBUTTONDOWN。
+        # 我们用 _seen_finger / _last_finger_* / _last_mouse_* 来区分"真手指"和
+        # "合成鼠标", 从而彻底去重, 既不漏掉真人点击, 也不会一次点击被算两遍。
+        self._seen_finger = False
+        self._last_finger_t = 0.0
+        self._last_finger_pos = (0.0, 0.0)
+        self._last_mouse_t = 0.0
+        self._last_mouse_pos = (0.0, 0.0)
         if SEED is not None:
             random.seed(SEED)
 
@@ -1763,26 +1779,63 @@ class Game:
             self.running = False
             return
 
-        # 手机端: SDL 触屏事件 -> 转成鼠标事件, 这样整套鼠标交互都能用
-        # 注意: 触屏坐标在这里已经换算成画布坐标了, 下面不能再换算一次
+        # ===== 触摸输入管线(手机端核心, 全局生效) =====
+        # 手机 SDL 对"一次触摸"会投递 FINGERDOWN, 并可能额外投递一个"合成的"
+        # MOUSEBUTTONDOWN(由 SDL_HINT_TOUCH_MOUSE_EVENTS 控制)。旧方案用
+        # "时间间隔+位置"去重, 会把真人快速连点当成重复而吞掉(表现: 点不动),
+        # 又可能因为两次投递间隔过大而漏去重(表现: 一次点击被算两遍/跳屏)。
+        #
+        # 新方案: 用"事件来源"去重, 而非"时间+位置"。
+        #   - 真手指事件(FINGER*) 一律认, 并记下来源位置/时间;
+        #   - 真实鼠标事件(MOUSE*) 在手机上只可能来自"合成鼠标", 只要它紧跟着
+        #     最近一次手指事件(0.3s 内、100px 内)就判为同一次触摸的副本并丢弃。
+        # 这样: 真人每一次手指点击都被处理(永不漏), 合成副本永不重复生效,
+        # 且对真人"快速连点不同按钮"完全无影响(手指事件本就不参与去重)。
+        FINGERDOWN = getattr(pygame, "FINGERDOWN", -1)
+        FINGERMOTION = getattr(pygame, "FINGERMOTION", -2)
+        FINGERUP = getattr(pygame, "FINGERUP", -3)
+        is_finger = ev.type in (FINGERDOWN, FINGERMOTION, FINGERUP)
+
+        if is_finger:
+            self._seen_finger = True
+
+        if IS_ANDROID and self._seen_finger and not is_finger:
+            # 这台设备已确认走手指通道, 真鼠标事件必是合成副本 -> 去重丢弃
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                now = time.time()
+                lx, ly = self._last_finger_pos
+                dx = abs(ev.pos[0] - lx)
+                dy = abs(ev.pos[1] - ly)
+                if (now - self._last_finger_t) < 0.3 and dx < 100 and dy < 100:
+                    return
+            else:
+                # 鼠标移动/抬起也来自合成, 直接丢弃(避免 hover 抖动/重复抬起)
+                return
+
         already_canvas = False
-        if ev.type in (getattr(pygame, "FINGERDOWN", -1),
-                       getattr(pygame, "FINGERMOTION", -2),
-                       getattr(pygame, "FINGERUP", -3)):
+        if is_finger:
             # 触屏给的是 0~1 的归一化坐标, 必须乘"窗口真实像素尺寸"——
             # SCALED 模式下 screen.get_size() 是 1280x800 的逻辑尺寸,
             # 乘它的话黑边区域会被算进去, 点击整体偏移。
             tw, th = self._win_w, self._win_h
             cpos = self._to_canvas_pos((ev.x * tw, ev.y * th))
             already_canvas = True
-            if ev.type == getattr(pygame, "FINGERDOWN", -1):
-                # 去重: 若 SDL 的"触屏模拟鼠标"没被完全关掉, 同一次触摸会
-                # 先到 FINGERDOWN 再到 MOUSEBUTTONDOWN。只认第一次。
-                if not self._accept_tap(cpos):
-                    return
+            if ev.type == FINGERDOWN:
+                # 极少数设备会"先发合成鼠标、后发手指"。若这次手指紧挨着最近一次
+                # 已处理的真实鼠标(0.3s/100px 内), 说明它是同一触摸的副本 -> 丢弃,
+                # 避免鼠标已处理过又来一遍(双向去重, 覆盖两种投递顺序)。
+                if IS_ANDROID:
+                    now = time.time()
+                    lx, ly = self._last_mouse_pos
+                    if ((now - self._last_mouse_t) < 0.3 and
+                            abs(cpos[0] - lx) < 100 and abs(cpos[1] - ly) < 100):
+                        return
+                # 记录手指来源, 供"合成鼠标"去重比对
+                self._last_finger_t = time.time()
+                self._last_finger_pos = (float(cpos[0]), float(cpos[1]))
                 ev = pygame.event.Event(pygame.MOUSEBUTTONDOWN,
                                         pos=cpos, button=1)
-            elif ev.type == getattr(pygame, "FINGERMOTION", -2):
+            elif ev.type == FINGERMOTION:
                 # 触屏拖动不改选择(rel 置 0, 被"必须真的移动"的规则挡掉)
                 ev = pygame.event.Event(pygame.MOUSEMOTION, pos=cpos,
                                         rel=(0, 0), buttons=(0, 0, 0))
@@ -1805,13 +1858,11 @@ class Game:
                         button=ev.button)
             except Exception:
                 pass
-            # 同上: 触摸模拟出来的鼠标按下也要去重, 否则一次点击处理两遍
-            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                try:
-                    if not self._accept_tap(ev.pos):
-                        return
-                except Exception:
-                    pass
+            # 安卓上"真实鼠标按下"只可能是合成副本(正常由上面手指分支已丢弃);
+            # 但若本设备走"鼠标优先"投递, 这里就是真实点击 —— 记下来源供双向去重。
+            if IS_ANDROID and ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                self._last_mouse_t = time.time()
+                self._last_mouse_pos = (float(ev.pos[0]), float(ev.pos[1]))
 
         if ev.type == pygame.MOUSEMOTION:
             self.mouse_pos = ev.pos
@@ -2959,8 +3010,8 @@ class Game:
                 self.match_stats["ai_power_shots"] += 1
         # 两端一致反馈: 手机"来电式"马达震动 + 桌面画面震动.
         # 规则(用户确认): 普通进球 / 普通扑救 均不震动;
-        #                大力射门进球 -> 280ms 强震(来电式节奏);
-        #                扑出"大力射门"(到达门线速度 >=25) -> 110ms.
+        #                大力射门进球 -> 500ms 强震(来电式节奏);
+        #                扑出"大力射门"(到达门线速度 >=25) -> 200ms.
         # 不震动时累加 skip 计数 —— 「操作说明」页能看到"规则跳过 X 次",
         # 用来区分到底是"马达坏了"还是"按规则本来就不该震".
         oc = self.last_outcome
@@ -2969,7 +3020,7 @@ class Game:
                 self.shake_t = max(self.shake_t, 0.45)
                 self.shake_amp = max(self.shake_amp, 11)
                 if IS_ANDROID:
-                    _android_vibrate(280)
+                    _android_vibrate(500)
             else:                            # 普通进球: 不震动
                 _VIB["skip"] += 1
         elif oc == "SAVE":
@@ -3340,10 +3391,8 @@ class Game:
                                        True, (170, 170, 170))
                 screen.blit(t, (panel_x + 24, y))
 
-        # 按钮: 测试震动 / 清日志 / 返回 (测试震动与清日志仅手机有意义)
-        r1 = self._dev_vib_rect()
-        h1 = self._point_in_rect(self.mouse_pos, r1)
-        self._draw_button(screen, r1, "测试震动", hover=h1, active=h1)
+        # 按钮: 清日志 / 球员测试 / 返回
+        # (「测试震动」按钮已整合进「球员测试」页, 见 _ptest_vib_rect)
         r2 = self._dev_clear_rect()
         h2 = self._point_in_rect(self.mouse_pos, r2)
         self._draw_button(screen, r2, "清日志", hover=h2)
@@ -3355,17 +3404,14 @@ class Game:
         h3 = self._point_in_rect(self.mouse_pos, r3)
         self._draw_button(screen, r3, "返回菜单", hover=h3)
 
-    def _dev_vib_rect(self):
+    def _dev_clear_rect(self):
         return self._button_rect(WIDTH // 2 - 320, HEIGHT - 60, 200, 46)
 
-    def _dev_clear_rect(self):
-        return self._button_rect(WIDTH // 2 - 105, HEIGHT - 60, 190, 46)
-
     def _dev_ptest_rect(self):
-        return self._button_rect(WIDTH // 2 + 110, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 - 105, HEIGHT - 60, 200, 46)
 
     def _dev_back_rect(self):
-        return self._button_rect(WIDTH // 2 + 330, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 + 110, HEIGHT - 60, 200, 46)
 
     def _handle_dev(self, ev):
         if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE,
@@ -3373,9 +3419,6 @@ class Game:
             self.state = State.MENU
             self.state_t = 0.0
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            if IS_ANDROID and self._point_in_rect(ev.pos, self._dev_vib_rect()):
-                _android_vibrate(320)
-                return
             if IS_ANDROID and self._point_in_rect(ev.pos, self._dev_clear_rect()):
                 _vib_log_lines.clear()
                 return
@@ -3436,9 +3479,6 @@ class Game:
             else:
                 self._tester_k_name = cur[:-1]
 
-    _PTEST_S_PRESETS = ["兔同笼", "只因兔", "重炮手", "快腿", "鹰眼", "Q版9"]
-    _PTEST_K_PRESETS = ["铁门神", "墙上盾", "灵猫", "老帅", "门神", "捕手K"]
-
     # 三列按钮布局: 每项一行, 左"-"右"+"(v1.17 加大: 88x60, 更好点)
     def _ptest_row_rects(self, col_x, row_y):
         """返回某列某行的 (-按钮, 数值区, +按钮)."""
@@ -3453,6 +3493,13 @@ class Game:
                            ("composure", "心理")]
     _PTEST_KEEPER_ROWS = [("reflex", "反应"), ("reach", "臂展"),
                           ("dive", "扑救")]
+
+    # 内置软键盘"中文"面板的常用字(代替完整输入法; 名字上限4汉字=8显示宽度)
+    _PTEST_CN_CHARS = [
+        "王", "李", "张", "刘", "陈", "杨", "赵", "黄", "周", "吴",
+        "大", "小", "飞", "龙", "虎", "鹰", "豹", "风", "雷", "火",
+        "明", "亮", "勇", "强", "帅", "美", "婷", "雪", "雨", "山",
+    ]
 
     def _draw_player_test(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
@@ -3497,9 +3544,13 @@ class Game:
         screen.blit(nt2, (nb[0] + 12, nb[1] + nb[3] // 2 - nt2.get_height() // 2))
         nlab = self.font_s.render("名字", True, (200, 200, 200))
         screen.blit(nlab, (lx + 30, nb[1] + nb[3] // 2 - nlab.get_height() // 2))
-        rr = self._ptest_srand_rect()
-        hr = self._point_in_rect(self.mouse_pos, rr)
-        self._draw_button(screen, rr, "随机名", hover=hr)
+        # 点名字框进入编辑(弹出内置软键盘, 见 _draw_keyboard / _handle_keyboard)
+        edit_hint = self.font_s.render(
+            "点此编辑" if editing is None else
+            ("输入中…(下方键盘)" if active_s else "点此编辑"),
+            True, (150, 200, 235))
+        screen.blit(edit_hint, (nb[0] + nb[2] + 12,
+                                nb[1] + nb[3] // 2 - edit_hint.get_height() // 2))
         # 数值行(下移, 给名字行让位)
         y = panel_y + 170
         for key, label in self._PTEST_STRIKER_ROWS:
@@ -3537,9 +3588,12 @@ class Game:
         screen.blit(nt3, (nb2[0] + 12, nb2[1] + nb2[3] // 2 - nt3.get_height() // 2))
         nlab2 = self.font_s.render("名字", True, (200, 200, 200))
         screen.blit(nlab2, (rx + 30, nb2[1] + nb2[3] // 2 - nlab2.get_height() // 2))
-        rr2 = self._ptest_krand_rect()
-        hr2 = self._point_in_rect(self.mouse_pos, rr2)
-        self._draw_button(screen, rr2, "随机名", hover=hr2)
+        edit_hint2 = self.font_s.render(
+            "点此编辑" if editing is None else
+            ("输入中…(下方键盘)" if active_k else "点此编辑"),
+            True, (150, 200, 235))
+        screen.blit(edit_hint2, (nb2[0] + nb2[2] + 12,
+                                 nb2[1] + nb2[3] // 2 - edit_hint2.get_height() // 2))
         y = panel_y + 170
         for key, label in self._PTEST_KEEPER_ROWS:
             v = self._ptest_keeper_stats()[key]
@@ -3553,7 +3607,10 @@ class Game:
                              val[1] + val[3] // 2 - vt.get_height() // 2))
             y += 78
 
-        # 底部按钮: 应用 / 返回
+        # 底部按钮: 测试震动 / 应用 / 返回
+        rv = self._ptest_vib_rect()
+        hv = self._point_in_rect(self.mouse_pos, rv)
+        self._draw_button(screen, rv, "测试震动", hover=hv, active=hv)
         rg = self._ptest_gen_rect()
         hg = self._point_in_rect(self.mouse_pos, rg)
         self._draw_button(screen, rg,
@@ -3566,6 +3623,9 @@ class Game:
         if msg:
             mt = self.font_s.render(msg, True, (150, 235, 150))
             screen.blit(mt, (WIDTH // 2 - mt.get_width() // 2, HEIGHT - 118))
+        # 编辑名字时弹出内置软键盘
+        if getattr(self, "_ptest_editing", None) in ("s", "k"):
+            self._draw_keyboard(screen)
 
     def _ptest_toggle_rect(self):
         return self._button_rect(WIDTH - 250, 24, 230, 44)
@@ -3576,19 +3636,15 @@ class Game:
     def _ptest_kname_rect(self):
         return (WIDTH // 2 + 40 + 110, 108 + 84, 240, 52)
 
-    def _ptest_srand_rect(self):
-        nb = self._ptest_sname_rect()
-        return (nb[0] + nb[2] + 12, nb[1], 110, nb[3])
-
-    def _ptest_krand_rect(self):
-        nb = self._ptest_kname_rect()
-        return (nb[0] + nb[2] + 12, nb[1], 110, nb[3])
-
     def _ptest_gen_rect(self):
         return self._button_rect(WIDTH // 2 - 130, HEIGHT - 56, 250, 48)
 
     def _ptest_back_rect(self):
         return self._button_rect(WIDTH // 2 + 170, HEIGHT - 56, 200, 48)
+
+    def _ptest_vib_rect(self):
+        """「测试震动」按钮(从开发者模块整合进来; 仅手机有意义)."""
+        return self._button_rect(WIDTH // 2 - 430, HEIGHT - 56, 200, 48)
 
     def _ptest_click_row(self, pos):
         """处理 +/- 点击. 返回 True 表示点中了某个按钮."""
@@ -3687,39 +3743,15 @@ class Game:
         self._ptest_msg = "  ".join(msgs)
 
     def _ptest_start_edit(self, which):
-        """进入名字编辑态, 并尝试唤起手机软键盘.
+        """进入名字编辑态: 弹出内置软键盘(纯画布按钮, 不依赖系统输入法).
 
-        两条路径都试, 且都写日志, 便于真机定位"手机输入法点不出来"的根因:
-          1) SDL start_text_input (pygame_sdl2 映射到 SDL_StartTextInput)
-          2) JNI 直接让 Android InputMethodManager 强制显示(兜底)
+        旧方案尝试调用 SDL start_text_input + JNI showSoftInput 唤起系统中文输入法,
+        但在多款真机上"点名字没反应/键盘拉不起来"。内置键盘用和 +/- 一样的画布按钮,
+        走同一套已验证可用的触摸管线, 因此一定能点; 中文用常用字面板代替完整输入法。
         """
         self._ptest_editing = which
-        rect = (self._ptest_sname_rect() if which == "s"
-                else self._ptest_kname_rect())
-        # 路径 1: SDL 文本输入
-        try:
-            has = hasattr(pygame.key, "start_text_input")
-            _vib_log("[NAME] 编辑(%s): start_text_input 可用=%s" % (which, has))
-            if has:
-                if not pygame.key.get_start_text_input():
-                    pygame.key.start_text_input()
-                pygame.key.set_text_input_rect(rect)
-                _vib_log("[NAME] 编辑(%s): 已调用 SDL start_text_input" % which)
-        except Exception as e:
-            _vib_log("[NAME] 编辑(%s): SDL 键盘异常 %s" % (which, e))
-        # 路径 2: JNI 兜底 —— 直接让 Android 显示输入法(即使 SDL 路径没生效也拉得起来)
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            activity = PythonActivity.mActivity
-            Ctx = autoclass("android.content.Context")
-            imm = activity.getSystemService(Ctx.INPUT_METHOD_SERVICE)
-            IMM = autoclass("android.view.inputmethod.InputMethodManager")
-            view = activity.getWindow().getDecorView()
-            imm.showSoftInput(view, IMM.SHOW_FORCED)
-            _vib_log("[NAME] 编辑(%s): JNI showSoftInput 已调用" % which)
-        except Exception as e:
-            _vib_log("[NAME] 编辑(%s): JNI 键盘异常 %s" % (which, e))
+        if not hasattr(self, "_kb_mode"):
+            self._kb_mode = "abc"
 
     def _ptest_which(self, pos):
         """只判断点中了哪个区域(只读, 不改数值), 用于诊断日志."""
@@ -3727,10 +3759,6 @@ class Game:
             return "名字(射)"
         if self._point_in_rect(pos, self._ptest_kname_rect()):
             return "名字(门)"
-        if self._point_in_rect(pos, self._ptest_srand_rect()):
-            return "随机(射)"
-        if self._point_in_rect(pos, self._ptest_krand_rect()):
-            return "随机(门)"
         if self._point_in_rect(pos, self._ptest_toggle_rect()):
             return "开关"
         for col_x, _s, rows in (
@@ -3751,11 +3779,176 @@ class Game:
         return "空白"
 
     def _ptest_stop_edit(self):
-        """退出编辑态并关闭软键盘."""
+        """退出编辑态(内置软键盘随之隐藏)."""
         self._ptest_editing = None
+
+    # ===== 内置软键盘(纯画布按钮, 不依赖系统输入法) =====
+    def _kb_panel_rect(self):
+        return (140, 408, 1000, 372)
+
+    def _kb_keys(self):
+        """返回当前模式下的所有键盘按键: (rect, label, action)."""
+        px, py, pw, ph = self._kb_panel_rect()
+        keys = []
+        # 顶栏: 模式切换 / 空格 / 完成
+        keys.append(((px + 16, py + 10, 150, 34),
+                     "中文" if self._kb_mode == "abc" else "ABC", "mode"))
+        keys.append(((px + 176, py + 10, 150, 34), "空格", "space"))
+        keys.append(((px + pw - 166, py + 10, 150, 34), "完成", "done"))
+        if self._kb_mode == "abc":
+            kw, kg, rh, gap = 90, 6, 52, 8
+            rows = [
+                list("QWERTYUIOP"),
+                list("ASDFGHJKL"),
+                list("ZXCVBNM"),
+                list("1234567890"),
+            ]
+            ry0 = py + 56
+            for ri, row in enumerate(rows):
+                n = len(row)
+                total = n * kw + (n - 1) * kg
+                sx = px + (pw - total) // 2
+                y = ry0 + ri * (rh + gap)
+                for ci, ch in enumerate(row):
+                    keys.append(((sx + ci * (kw + kg), y, kw, rh),
+                                 ch, "char:" + ch))
+            # 删除键(宽)
+            bw = 220
+            sx = px + (pw - bw) // 2
+            y = ry0 + 4 * (rh + gap)
+            keys.append(((sx, y, bw, rh), "删除", "back"))
+        else:
+            kw, kg, rh, gap = 154, 6, 52, 8
+            ry0 = py + 56
+            cn = self._PTEST_CN_CHARS
+            cols = 6
+            for i, ch in enumerate(cn):
+                r = i // cols
+                c = i % cols
+                x = px + 23 + c * (kw + kg)
+                y = ry0 + r * (rh + gap)
+                keys.append(((x, y, kw, rh), ch, "char:" + ch))
+        return keys
+
+    def _draw_keyboard(self, screen):
+        px, py, pw, ph = self._kb_panel_rect()
+        # 半透明遮罩(提示"现在在输名字", 并挡住被键盘盖住的下方控件)
+        screen.blit(self._dim_overlay(150), (0, 0))
+        pygame.draw.rect(screen, (28, 30, 40), (px, py, pw, ph), border_radius=14)
+        pygame.draw.rect(screen, GOLD, (px, py, pw, ph), 2, border_radius=14)
+        tip = self.font_s.render(
+            "输入名字(内置键盘 · 上限8字母/4汉字)", True, (220, 220, 220))
+        screen.blit(tip, (px + 16, py + ph - 26))
+        for rect, label, action in self._kb_keys():
+            if action in ("mode", "space", "done"):
+                hover = self._point_in_rect(self.mouse_pos, rect)
+                self._draw_button(screen, rect, label, hover=hover,
+                                  active=(action == "done"))
+            else:
+                hover = self._point_in_rect(self.mouse_pos, rect)
+                col = (70, 72, 84) if not hover else (95, 98, 112)
+                pygame.draw.rect(screen, col, rect, border_radius=6)
+                pygame.draw.rect(screen, (110, 112, 124), rect, 1,
+                                border_radius=6)
+                t = self.font_m.render(label, True, WHITE)
+                screen.blit(t, (rect[0] + rect[2] // 2 - t.get_width() // 2,
+                                rect[1] + rect[3] // 2 - t.get_height() // 2))
+
+    def _handle_keyboard(self, ev):
+        """处理软键盘面板内的点击(仅在编辑态、且点击落在面板内时被调用)."""
+        pos = ev.pos
+        which = self._ptest_editing
+        if which is None:
+            return
+        for rect, label, action in self._kb_keys():
+            if self._point_in_rect(pos, rect):
+                if action == "done":
+                    self._ptest_stop_edit()
+                    self._ptest_save_config()
+                elif action == "mode":
+                    self._kb_mode = "cn" if self._kb_mode == "abc" else "abc"
+                elif action == "space":
+                    self._ptest_append_name(which, " ")
+                elif action == "back":
+                    self._ptest_backspace(which)
+                elif action.startswith("char:"):
+                    self._ptest_append_name(which, action[5:])
+                return
+
+    # ===== 本地文件记忆(自建角色数值/名字/开关) =====
+    def _ptest_config_path(self):
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                activity = PythonActivity.mActivity
+                d = activity.getExternalFilesDir(None).getAbsolutePath()
+            except Exception:
+                d = "."
+        else:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "local_data")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+        return os.path.join(d, "ptest_config.json")
+
+    def _ptest_truncate(self, name):
+        """名字按显示宽度(汉字=2)截断到上限 8."""
+        out = ""
+        for ch in (name or ""):
+            if self._name_disp_width(out + ch) > 8:
+                break
+            out += ch
+        return out or "自建射手"
+
+    def _ptest_save_config(self):
+        """把自建角色(名字/数值/开关)写入本地文件, 下次启动自动恢复."""
         try:
-            if pygame.key.get_start_text_input():
-                pygame.key.stop_text_input()
+            import json as _json
+            s = self._ptest_striker_stats()
+            k = self._ptest_keeper_stats()
+            data = {
+                "s_name": self._ptest_sname(),
+                "k_name": self._ptest_kname(),
+                "s_stats": dict(s),
+                "k_stats": dict(k),
+                "on": self._ptest_enabled(),
+            }
+            with open(self._ptest_config_path(), "w", encoding="utf-8") as fh:
+                _json.dump(data, fh, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _ptest_load_config(self):
+        """启动时读取本地文件, 恢复上次自建角色(若开关为"是"则重新入卡)."""
+        try:
+            import json as _json
+            p = self._ptest_config_path()
+            if not os.path.exists(p):
+                return
+            with open(p, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            self._tester_s_name = self._ptest_truncate(
+                str(data.get("s_name", "自建射手")))
+            self._tester_k_name = self._ptest_truncate(
+                str(data.get("k_name", "自建门将")))
+            ss = data.get("s_stats", {}) or {}
+            self._tester_striker = {
+                "power": max(1, min(10, int(ss.get("power", 7)))),
+                "accuracy": max(1, min(10, int(ss.get("accuracy", 7)))),
+                "composure": max(1, min(10, int(ss.get("composure", 7)))),
+            }
+            ks = data.get("k_stats", {}) or {}
+            self._tester_keeper = {
+                "reflex": max(1, min(10, int(ks.get("reflex", 7)))),
+                "reach": max(1, min(10, int(ks.get("reach", 7)))),
+                "dive": max(1, min(10, int(ks.get("dive", 7)))),
+            }
+            self._tester_on = bool(data.get("on", False))
+            if self._tester_on:
+                self._ptest_generate()
         except Exception:
             pass
 
@@ -3791,36 +3984,43 @@ class Game:
             _vib_log("[PTEST] 点击 pos=%s 命中=%s 编辑中=%s"
                      % (tuple(int(p) for p in ev.pos),
                         self._ptest_which(ev.pos), editing))
-            # 先点名字框进入编辑态(并唤起手机输入法)
+            # 编辑态: 名字框可切换编辑对象; 软键盘区域交给 _handle_keyboard
+            if editing in ("s", "k"):
+                if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
+                    self._ptest_start_edit("s")
+                    return
+                if self._point_in_rect(ev.pos, self._ptest_kname_rect()):
+                    self._ptest_start_edit("k")
+                    return
+                # 软键盘面板内 -> 处理键盘按键(否则编辑中点击其它区域忽略,
+                # 避免误触被键盘挡住的控件)
+                if self._point_in_rect(ev.pos, self._kb_panel_rect()):
+                    self._handle_keyboard(ev)
+                return
+            # 未编辑: 点名字框进入编辑(弹出内置软键盘)
             if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
                 self._ptest_start_edit("s")
                 return
             if self._point_in_rect(ev.pos, self._ptest_kname_rect()):
                 self._ptest_start_edit("k")
                 return
-            if self._point_in_rect(ev.pos, self._ptest_srand_rect()):
-                import random as _r
-                self._tester_s_name = _r.choice(self._PTEST_S_PRESETS)
-                self._ptest_stop_edit()
+            # 测试震动(从开发者模块整合进来; 仅手机有意义)
+            if IS_ANDROID and self._point_in_rect(ev.pos, self._ptest_vib_rect()):
+                _android_vibrate(320)
                 return
-            if self._point_in_rect(ev.pos, self._ptest_krand_rect()):
-                import random as _r
-                self._tester_k_name = _r.choice(self._PTEST_K_PRESETS)
-                self._ptest_stop_edit()
-                return
-            # 开关: 是 <-> 否 (即时生效: 是=加入, 否=移除)
+            # 开关: 是 <-> 否 (即时生效: 是=加入, 否=移除; 同时持久化)
             if self._point_in_rect(ev.pos, self._ptest_toggle_rect()):
                 self._tester_on = not self._ptest_enabled()
-                self._ptest_stop_edit()
                 self._ptest_generate()
+                self._ptest_save_config()
                 return
             if self._ptest_click_row(ev.pos):
                 return
             if self._point_in_rect(ev.pos, self._ptest_gen_rect()):
                 self._ptest_generate()
+                self._ptest_save_config()
                 return
             if self._point_in_rect(ev.pos, self._ptest_back_rect()):
-                self._ptest_stop_edit()
                 self.state = State.DEV
                 self.state_t = 0.0
 
