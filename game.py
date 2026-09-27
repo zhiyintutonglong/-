@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.13"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.14"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -356,10 +356,12 @@ def _vib_create_notification_channel():
         if BuildVer.SDK_INT >= 26:  # API26+ (Android 8.0+)
             NotificationChannel = autoclass("android.app.NotificationChannel")
             channelId = "dqls_vib_channel"
+            # 第三个参数是 importance, 必须传整数!
+            # IMPORTANCE_DEFAULT = 3 (日志报 "an integer is required" 就是这里传错了)
             channel = NotificationChannel(
                 channelId,
                 "游戏震动",
-                NotificationChannel  # IMPORTANCE_DEFAULT = 3
+                3  # IMPORTANCE_DEFAULT
             )
             channel.enableVibration(True)
             # 来电式波形: 0ms延迟, 震100, 歇50, 震100
@@ -392,12 +394,13 @@ def _vib_notify_vibrate(ms):
         nm = activity.getSystemService(Context.NOTIFICATION_SERVICE)
         _vib_create_notification_channel()
         BuildVer = autoclass("android.os.Build$VERSION")
-        # 用原生 Notification.Builder(不依赖 AndroidX 库)
-        Notification = autoclass("android.app.Notification")
+        # 原生 Notification.Builder —— jnius 里嵌套类要用 $ 访问!
+        # (日志报 "has no attribute 'Builder'" 就是写成 Notification.Builder 了)
+        Builder = autoclass("android.app.Notification$Builder")
         if BuildVer.SDK_INT >= 26:
-            builder = Notification.Builder(activity, "dqls_vib_channel")
+            builder = Builder(activity, "dqls_vib_channel")
         else:
-            builder = Notification.Builder(activity)
+            builder = Builder(activity)
         # 小图标: 用 app 自己的图标
         try:
             icon_id = activity.getApplicationInfo().icon
@@ -3662,10 +3665,13 @@ class Game:
                              (p3a[0]+ox, p3a[1]+oy), (p4a[0]+ox, p4a[1]+oy)], 1)
 
     def _draw_gradient_bg(self, screen, top, bot):
-        # 简单垂直渐变 - 只画上半部分(天空区域), 下半部分留给草地
-        sky_h = int(HEIGHT * 0.42)  # 天空区域高度
-        for i in range(0, sky_h, 4):
-            t = i / sky_h if sky_h > 0 else 0
+        # 简单垂直渐变 - 画满全屏作为背景/清屏
+        # 重要: 必须画满全屏! 菜单/说明页靠它清屏, 只画一部分会导致
+        # 页面切换时上一帧的内容残留(草地色块从中间开始, 中间空档不清屏).
+        # 比赛场景的草地图层(_scene_cache)会覆盖下半部分, 不受影响.
+        h = HEIGHT
+        for i in range(0, h, 4):
+            t = i / h
             r = int(top[0] * (1 - t) + bot[0] * t)
             g = int(top[1] * (1 - t) + bot[1] * t)
             b = int(top[2] * (1 - t) + bot[2] * t)
