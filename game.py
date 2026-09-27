@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.14"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.15"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -365,9 +365,8 @@ def _vib_create_notification_channel():
             )
             channel.enableVibration(True)
             # 来电式波形: 0ms延迟, 震100, 歇50, 震100
-            import array
-            pattern = array.array('j', [0, 100, 50, 100])
-            channel.setVibrationPattern(pattern.tolist())
+            # 直接传 Python list 让 jnius 转 long[](用 array.array('j') 会报 bad typecode)
+            channel.setVibrationPattern([0, 100, 50, 100])
             nm.createNotificationChannel(channel)
             _vib_channel_created = True
             _VIB["notif"] = "通道已建"
@@ -418,6 +417,36 @@ def _vib_notify_vibrate(ms):
         builder.setAutoCancel(True)
         nm.notify(9991, builder.build())
         _vib_log("通知震动已发出: ms=%d icon=%s" % (ms, icon_id))
+        # 延迟取消通知(震动已经在系统层触发, cancel 只清通知栏, 免得每次进球都堆一条)
+        try:
+            Handler = autoclass("android.os.Handler")
+            Looper = autoclass("android.os.Looper")
+
+            class _CancelRunnable(PythonJavaClass):
+                __javainterfaces__ = ['java/lang/Runnable']
+                __javacontext__ = 'app'
+
+                def __init__(self, fn):
+                    super().__init__()
+                    self._fn = fn
+
+                @java_method('()V')
+                def run(self):
+                    try:
+                        self._fn()
+                    except Exception:
+                        pass
+
+            def _do_cancel():
+                try:
+                    nm.cancel(9991)
+                except Exception:
+                    pass
+
+            Handler(Looper.getMainLooper()).postDelayed(
+                _CancelRunnable(_do_cancel), 1500)
+        except Exception:
+            pass
         return True
     except Exception as e:
         _vib_log("通知震动失败: %s" % e)
@@ -1073,6 +1102,9 @@ class StrikerState:
 class State(Enum):
     MENU = auto()
     HELP = auto()                # 操作说明页面
+    DEV = auto()                 # 开发者模块(震动自检/日志等诊断内容)
+    # 菜单项数量: 开始比赛 / 操作说明 / 开发者模块 / 退出游戏
+    MENU_ITEM_COUNT = 4
     SELECT_STRIKER = auto()
     SELECT_KEEPER = auto()
     READY = auto()              # 准备阶段(显示轮次/攻守)
@@ -1765,6 +1797,8 @@ class Game:
             self._handle_menu(ev)
         elif self.state == State.HELP:
             self._handle_help(ev)
+        elif self.state == State.DEV:
+            self._handle_dev(ev)
         elif self.state == State.SELECT_STRIKER:
             self._handle_select_striker(ev)
         elif self.state == State.SELECT_KEEPER:
@@ -1796,24 +1830,27 @@ class Game:
         elif self.menu_idx == 1:
             self.state = State.HELP
             self.state_t = 0.0
+        elif self.menu_idx == 2:
+            self.state = State.DEV
+            self.state_t = 0.0
         else:
             self.running = False
 
     def _handle_menu(self, ev):
         if ev.type == pygame.KEYDOWN:
             if ev.key in (pygame.K_UP, pygame.K_w):
-                self.menu_idx = (self.menu_idx - 1) % 3
+                self.menu_idx = (self.menu_idx - 1) % MENU_ITEM_COUNT
             elif ev.key in (pygame.K_DOWN, pygame.K_s):
-                self.menu_idx = (self.menu_idx + 1) % 3
+                self.menu_idx = (self.menu_idx + 1) % MENU_ITEM_COUNT
             elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self._menu_confirm()
         elif ev.type == pygame.MOUSEMOTION:
-            for i in range(3):
+            for i in range(MENU_ITEM_COUNT):
                 if self._point_in_rect(ev.pos, self._menu_item_rect(i)):
                     self.menu_idx = i
                     break
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            for i in range(3):
+            for i in range(MENU_ITEM_COUNT):
                 if self._point_in_rect(ev.pos, self._menu_item_rect(i)):
                     self.menu_idx = i
                     self._menu_confirm()
@@ -2054,10 +2091,6 @@ class Game:
                 self.state = State.MENU
                 self.state_t = 0.0
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            # 点击「测试震动」: 立刻让马达响一下, 并把结果写进自检状态行
-            if IS_ANDROID and self._point_in_rect(ev.pos, self._help_vib_rect()):
-                _android_vibrate(320)
-                return
             # 点击返回按钮
             if self._point_in_rect(ev.pos, self._help_back_rect()):
                 self.state = State.MENU
@@ -3027,6 +3060,8 @@ class Game:
             self._draw_menu(screen)
         elif self.state == State.HELP:
             self._draw_help(screen)
+        elif self.state == State.DEV:
+            self._draw_dev(screen)
         elif self.state == State.SELECT_STRIKER:
             self._draw_select_striker(screen)
         elif self.state == State.SELECT_KEEPER:
@@ -3191,30 +3226,95 @@ class Game:
         ver = self.font_s.render("版本号：%s" % VERSION, True, (200, 200, 200))
         screen.blit(dev, (WIDTH // 2 - dev.get_width() // 2, info_y))
         screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, info_y + 26))
-        # 震动自检状态(手机上看这里就知道马达到底调用了没有 / 哪一步失败)
-        for i, (txt, col) in enumerate(vib_status_lines()[:4]):
-            t = self.font_s.render(txt, True, col)
-            screen.blit(t, (WIDTH // 2 - t.get_width() // 2, info_y + 44 + i * 21))
-        # 底部两个按钮: 测试震动 / 返回菜单
-        if IS_ANDROID:
-            r = self._help_vib_rect()
-            hv = self._point_in_rect(self.mouse_pos, r)
-            self._draw_button(screen, r, "测试震动", hover=hv, active=(hv))
-            rect = self._help_back_rect()
-        else:
-            rect = self._help_back_rect()
+        # 返回按钮(居中)
+        rect = self._help_back_rect()
         hover = self._point_in_rect(self.mouse_pos, rect)
         self._draw_button(screen, rect, "返回菜单", hover=hover)
 
-    def _help_vib_rect(self):
-        """「测试震动」按钮矩形(仅安卓可见)."""
-        return self._button_rect(WIDTH // 2 - 130, HEIGHT - 40, 230, 46)
-
     def _help_back_rect(self):
-        """「返回菜单」按钮矩形(说明页底部)."""
-        if IS_ANDROID:
-            return self._button_rect(WIDTH // 2 + 130, HEIGHT - 40, 230, 46)
+        """「返回菜单」按钮矩形(说明页底部, 居中)."""
         return self._button_rect(WIDTH // 2, HEIGHT - 40, 220, 46)
+
+    # ----- 开发者模块(震动自检 / 诊断) -----
+    def _draw_dev(self, screen):
+        """开发者模块: 集中放所有震动自检与诊断反馈(已移出操作说明页)."""
+        self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
+        panel_x, panel_y = WIDTH // 2 - 450, 60
+        panel_w, panel_h = 900, 620
+        pygame.draw.rect(screen, PANEL, (panel_x, panel_y, panel_w, panel_h),
+                         border_radius=14)
+        pygame.draw.rect(screen, GOLD, (panel_x, panel_y, panel_w, panel_h), 2,
+                         border_radius=14)
+        title = self.font_l.render("开发者模块 - 震动自检", True, GOLD)
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, panel_y + 18))
+        ver = self.font_s.render("版本号 %s   开发者：只因兔同笼" % VERSION,
+                                 True, (190, 190, 190))
+        screen.blit(ver, (WIDTH // 2 - ver.get_width() // 2, panel_y + 58))
+
+        y = panel_y + 100
+        if not IS_ANDROID:
+            t = self.font_m.render("桌面端无马达, 请在手机上查看", True, (200, 200, 200))
+            screen.blit(t, (WIDTH // 2 - t.get_width() // 2, y))
+        else:
+            # 震动状态明细(全部诊断信息集中在这里)
+            for txt, col in vib_status_lines()[:6]:
+                t = self.font_s.render(txt, True, col)
+                screen.blit(t, (panel_x + 24, y))
+                y += 26
+            y += 10
+            # 日志尾部(方便现场看最后几条)
+            tail = _vib_log_lines[-5:] if _vib_log_lines else []
+            if tail:
+                lt = self.font_s.render("最近日志:", True, (180, 200, 230))
+                screen.blit(lt, (panel_x + 24, y))
+                y += 24
+                for ln in tail:
+                    t = self.font_s.render(ln[:62], True, (170, 190, 210))
+                    screen.blit(t, (panel_x + 24, y))
+                    y += 22
+            else:
+                t = self.font_s.render("暂无日志", True, (170, 170, 170))
+                screen.blit(t, (panel_x + 24, y))
+
+        # 按钮: 测试震动 / 清日志 / 返回
+        if IS_ANDROID:
+            r1 = self._dev_vib_rect()
+            h1 = self._point_in_rect(self.mouse_pos, r1)
+            self._draw_button(screen, r1, "测试震动", hover=h1, active=h1)
+            r2 = self._dev_clear_rect()
+            h2 = self._point_in_rect(self.mouse_pos, r2)
+            self._draw_button(screen, r2, "清日志", hover=h2)
+            r3 = self._dev_back_rect()
+        else:
+            r3 = self._button_rect(WIDTH // 2, HEIGHT - 60, 220, 46)
+        h3 = self._point_in_rect(self.mouse_pos, r3)
+        self._draw_button(screen, r3, "返回菜单", hover=h3)
+
+    def _dev_vib_rect(self):
+        return self._button_rect(WIDTH // 2 - 250, HEIGHT - 60, 220, 46)
+
+    def _dev_clear_rect(self):
+        return self._button_rect(WIDTH // 2, HEIGHT - 60, 200, 46)
+
+    def _dev_back_rect(self):
+        return self._button_rect(WIDTH // 2 + 250, HEIGHT - 60, 220, 46)
+
+    def _handle_dev(self, ev):
+        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE,
+                                                    pygame.K_ESCAPE):
+            self.state = State.MENU
+            self.state_t = 0.0
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if IS_ANDROID and self._point_in_rect(ev.pos, self._dev_vib_rect()):
+                _android_vibrate(320)
+                return
+            if IS_ANDROID and self._point_in_rect(ev.pos, self._dev_clear_rect()):
+                _vib_log_lines.clear()
+                return
+            if self._point_in_rect(ev.pos, self._dev_back_rect()):
+                self.state = State.MENU
+                self.state_t = 0.0
 
     def _draw_early_end_popup(self, screen):
         """提前结束弹窗 - 用户选择继续或结算."""
@@ -3295,7 +3395,7 @@ class Game:
         screen.blit(ver, (WIDTH - ver.get_width() - 18, HEIGHT - 28))
 
         # 菜单选项
-        items = ["开始比赛", "操作说明", "退出游戏"]
+        items = ["开始比赛", "操作说明", "开发者模块", "退出游戏"]
         for i, it in enumerate(items):
             sel = (i == self.menu_idx)
             rect = self._menu_item_rect(i)
