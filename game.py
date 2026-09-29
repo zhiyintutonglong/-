@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.19"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.20"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -495,6 +495,76 @@ def _params_load():
         _log("PARAM", "已载入可调参数")
     except Exception as e:
         _log_exc("PARAM", e)
+
+
+# ===== 系统输入法(IME)唤起 / 收起 v1.20 =====
+# 用户要求: 自定义名字时直接用手机系统输入法, 不再提供内置键盘。
+# 注意: 内置键盘当初就是因为"系统 IME 在部分真机拉不起来"才加的, 所以这里
+# 同时走两条路(SDL 文本输入 + JNI InputMethodManager), 并把每条路的结果写日志,
+# 万一你的机器拉不起来, 导出日志就能看出是哪一步失败。
+def _ime_show():
+    """唤起手机系统输入法。返回实际生效的方式列表(也写日志)。"""
+    if not IS_ANDROID:
+        return "desktop"
+    got = []
+    # 1) SDL 文本输入: SDL2 在安卓上会去唤 IME, 同时决定收不收 TEXTINPUT
+    try:
+        sti = getattr(pygame.key, "start_text_input", None)
+        if sti:
+            sti()
+            got.append("sdl_start_text_input")
+    except Exception as e:
+        _log_exc("IME", e)
+    # 2) JNI: 让当前窗口拿到焦点后强制弹输入法(兜底)
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Context = autoclass("android.content.Context")
+        imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
+        view = activity.getWindow().getDecorView()
+        try:
+            view.setFocusableInTouchMode(True)
+            view.requestFocus()
+        except Exception:
+            pass
+        try:
+            imm.showSoftInput(view, imm.SHOW_IMPLICIT)
+            got.append("imm_showSoftInput")
+        except Exception as e:
+            _log_exc("IME", e)
+        try:
+            imm.toggleSoftInput(imm.SHOW_FORCED, 0)
+            got.append("imm_toggleSoftInput")
+        except Exception:
+            pass
+    except Exception as e:
+        _log_exc("IME", e)
+    _log("IME", "唤起系统输入法 -> %s" % (", ".join(got) or "全部失败"))
+    return got
+
+
+def _ime_hide():
+    """收起系统输入法。"""
+    if not IS_ANDROID:
+        return
+    try:
+        sti = getattr(pygame.key, "stop_text_input", None)
+        if sti:
+            sti()
+    except Exception:
+        pass
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Context = autoclass("android.content.Context")
+        imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
+        view = activity.getWindow().getDecorView()
+        imm.hideSoftInputFromWindow(view.getWindowToken(), 0)
+        _log("IME", "已收起系统输入法")
+    except Exception as e:
+        _log_exc("IME", e)
 
 
 _VIB = {
@@ -2029,7 +2099,13 @@ class Game:
         if is_finger:
             self._seen_finger = True
 
-        if IS_ANDROID and self._seen_finger and not is_finger:
+        # v1.20 修复(严重): 原来这里是 `if IS_ANDROID and _seen_finger and not is_finger`,
+        # 于是只要手指点过一次, **所有非鼠标事件都会走 else 分支被 return** ——
+        # 包括 KEYDOWN 和 TEXTINPUT。后果: 真机上点名字框能进编辑态, 但系统输入法
+        # 打的字一个都进不来(还有键盘回车也失效)。去重只应该管鼠标事件。
+        if (IS_ANDROID and self._seen_finger and not is_finger and
+                ev.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN,
+                            pygame.MOUSEBUTTONUP)):
             # 这台设备已确认走手指通道, 真鼠标事件必是合成副本 -> 去重丢弃
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 now = time.time()
@@ -2143,6 +2219,11 @@ class Game:
             # K_AC_BACK = 安卓返回键
             ac_back = getattr(pygame, "K_AC_BACK", None)
             if ev.key == pygame.K_ESCAPE or (ac_back and ev.key == ac_back):
+                # v1.20: 正在编辑名字时按返回/ESC, 必须先退出编辑(顺带收起输入法)。
+                # 否则回到菜单后 _ptest_editing 还留着, 再进球员测试会发现
+                # "莫名其妙还在编辑态", 而且输入法可能没收回去。
+                if getattr(self, "_ptest_editing", None) is not None:
+                    self._ptest_stop_edit()
                 if self.state == State.MENU:
                     self.running = False
                 else:
@@ -3954,12 +4035,6 @@ class Game:
     _PTEST_KEEPER_ROWS = [("reflex", "反应"), ("reach", "臂展"),
                           ("dive", "扑救")]
 
-    # 内置软键盘"中文"面板的常用字(代替完整输入法; 名字上限4汉字=8显示宽度)
-    _PTEST_CN_CHARS = [
-        "王", "李", "张", "刘", "陈", "杨", "赵", "黄", "周", "吴",
-        "大", "小", "飞", "龙", "虎", "鹰", "豹", "风", "雷", "火",
-        "明", "亮", "勇", "强", "帅", "美", "婷", "雪", "雨", "山",
-    ]
 
     def _draw_player_test(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
@@ -4004,7 +4079,7 @@ class Game:
         screen.blit(nt2, (nb[0] + 12, nb[1] + nb[3] // 2 - nt2.get_height() // 2))
         nlab = self.font_s.render("名字", True, (200, 200, 200))
         screen.blit(nlab, (lx + 30, nb[1] + nb[3] // 2 - nlab.get_height() // 2))
-        # 点名字框进入编辑(弹出内置软键盘, 见 _draw_keyboard / _handle_keyboard)
+        # 点名字框进入编辑(v1.20: 唤起手机系统输入法; 输完点「完成」)
         edit_hint = self.font_s.render(
             "点此编辑" if editing is None else
             ("输入中…(下方键盘)" if active_s else "点此编辑"),
@@ -4083,9 +4158,17 @@ class Game:
         if msg:
             mt = self.font_s.render(msg, True, (150, 235, 150))
             screen.blit(mt, (WIDTH // 2 - mt.get_width() // 2, HEIGHT - 118))
-        # 编辑名字时弹出内置软键盘
+        # v1.20: 不再画内置键盘, 改用手机系统输入法。
+        # 编辑态下画一个「完成」按钮 + 提示, 让玩家知道怎么收尾。
         if getattr(self, "_ptest_editing", None) in ("s", "k"):
-            self._draw_keyboard(screen)
+            rd = self._ptest_done_rect()
+            hd = self._point_in_rect(self.mouse_pos, rd)
+            self._draw_button(screen, rd, "完成", hover=hd, active=True)
+            tip = self.font_s.render(
+                "请用手机输入法输入(上限8字母/4汉字); 输完按回车或点「完成」",
+                True, (220, 220, 220))
+            screen.blit(tip, (WIDTH // 2 - tip.get_width() // 2,
+                              rd[1] + rd[3] + 8))
 
     def _ptest_toggle_rect(self):
         return self._button_rect(WIDTH - 250, 24, 230, 44)
@@ -4095,6 +4178,14 @@ class Game:
 
     def _ptest_kname_rect(self):
         return (WIDTH // 2 + 40 + 110, 108 + 84, 240, 52)
+
+    def _ptest_done_rect(self):
+        """v1.20: 系统输入法模式下用来结束编辑的「完成」按钮。
+
+        放在射手列(110~450)与门将列(710~1050)中间的空白区(500~660),
+        既不会被数值行的加减号压住, 也不会压住名字框(名字框 y 结束在 244)。
+        """
+        return self._button_rect(WIDTH // 2 - 60, 270, 160, 44)
 
     def _ptest_gen_rect(self):
         return self._button_rect(WIDTH // 2 - 130, HEIGHT - 56, 250, 48)
@@ -4211,15 +4302,16 @@ class Game:
         self._ptest_msg = "  ".join(msgs)
 
     def _ptest_start_edit(self, which):
-        """进入名字编辑态: 弹出内置软键盘(纯画布按钮, 不依赖系统输入法).
+        """进入名字编辑态: v1.20 改为直接唤起手机系统输入法。
 
-        旧方案尝试调用 SDL start_text_input + JNI showSoftInput 唤起系统中文输入法,
-        但在多款真机上"点名字没反应/键盘拉不起来"。内置键盘用和 +/- 一样的画布按钮,
-        走同一套已验证可用的触摸管线, 因此一定能点; 中文用常用字面板代替完整输入法。
+        用户要求"不要自带输入法", 所以这里走 _ime_show()(SDL 文本输入 + JNI IMM)。
+        名字由系统输入法输入(走 TEXTINPUT 事件)。
         """
         self._ptest_editing = which
-        if not hasattr(self, "_kb_mode"):
-            self._kb_mode = "abc"
+        try:
+            _ime_show()
+        except Exception as e:
+            _log_exc("IME", e)
 
     def _ptest_which(self, pos):
         """只判断点中了哪个区域(只读, 不改数值), 用于诊断日志."""
@@ -4247,101 +4339,26 @@ class Game:
         return "空白"
 
     def _ptest_stop_edit(self):
-        """退出编辑态(内置软键盘随之隐藏)."""
+        """退出编辑态(顺便收起系统输入法). 只退出, 不保存。"""
         self._ptest_editing = None
+        try:
+            _ime_hide()
+        except Exception as e:
+            _log_exc("IME", e)
 
-    # ===== 内置软键盘(纯画布按钮, 不依赖系统输入法) =====
-    def _kb_panel_rect(self):
-        return (140, 408, 1000, 372)
+    def _ptest_finish_edit(self):
+        """确认编辑: 退出编辑态 + 保存配置。
 
-    def _kb_keys(self):
-        """返回当前模式下的所有键盘按键: (rect, label, action)."""
-        px, py, pw, ph = self._kb_panel_rect()
-        keys = []
-        # 顶栏: 模式切换 / 空格 / 完成
-        keys.append(((px + 16, py + 10, 150, 34),
-                     "中文" if self._kb_mode == "abc" else "ABC", "mode"))
-        keys.append(((px + 176, py + 10, 150, 34), "空格", "space"))
-        keys.append(((px + pw - 166, py + 10, 150, 34), "完成", "done"))
-        if self._kb_mode == "abc":
-            kw, kg, rh, gap = 90, 6, 52, 8
-            rows = [
-                list("QWERTYUIOP"),
-                list("ASDFGHJKL"),
-                list("ZXCVBNM"),
-                list("1234567890"),
-            ]
-            ry0 = py + 56
-            for ri, row in enumerate(rows):
-                n = len(row)
-                total = n * kw + (n - 1) * kg
-                sx = px + (pw - total) // 2
-                y = ry0 + ri * (rh + gap)
-                for ci, ch in enumerate(row):
-                    keys.append(((sx + ci * (kw + kg), y, kw, rh),
-                                 ch, "char:" + ch))
-            # 删除键(宽)
-            bw = 220
-            sx = px + (pw - bw) // 2
-            y = ry0 + 4 * (rh + gap)
-            keys.append(((sx, y, bw, rh), "删除", "back"))
-        else:
-            kw, kg, rh, gap = 154, 6, 52, 8
-            ry0 = py + 56
-            cn = self._PTEST_CN_CHARS
-            cols = 6
-            for i, ch in enumerate(cn):
-                r = i // cols
-                c = i % cols
-                x = px + 23 + c * (kw + kg)
-                y = ry0 + r * (rh + gap)
-                keys.append(((x, y, kw, rh), ch, "char:" + ch))
-        return keys
-
-    def _draw_keyboard(self, screen):
-        px, py, pw, ph = self._kb_panel_rect()
-        # 半透明遮罩(提示"现在在输名字", 并挡住被键盘盖住的下方控件)
-        screen.blit(self._dim_overlay(150), (0, 0))
-        pygame.draw.rect(screen, (28, 30, 40), (px, py, pw, ph), border_radius=14)
-        pygame.draw.rect(screen, GOLD, (px, py, pw, ph), 2, border_radius=14)
-        tip = self.font_s.render(
-            "输入名字(内置键盘 · 上限8字母/4汉字)", True, (220, 220, 220))
-        screen.blit(tip, (px + 16, py + ph - 26))
-        for rect, label, action in self._kb_keys():
-            if action in ("mode", "space", "done"):
-                hover = self._point_in_rect(self.mouse_pos, rect)
-                self._draw_button(screen, rect, label, hover=hover,
-                                  active=(action == "done"))
-            else:
-                hover = self._point_in_rect(self.mouse_pos, rect)
-                col = (70, 72, 84) if not hover else (95, 98, 112)
-                pygame.draw.rect(screen, col, rect, border_radius=6)
-                pygame.draw.rect(screen, (110, 112, 124), rect, 1,
-                                border_radius=6)
-                t = self.font_m.render(label, True, WHITE)
-                screen.blit(t, (rect[0] + rect[2] // 2 - t.get_width() // 2,
-                                rect[1] + rect[3] // 2 - t.get_height() // 2))
-
-    def _handle_keyboard(self, ev):
-        """处理软键盘面板内的点击(仅在编辑态、且点击落在面板内时被调用)."""
-        pos = ev.pos
-        which = self._ptest_editing
-        if which is None:
-            return
-        for rect, label, action in self._kb_keys():
-            if self._point_in_rect(pos, rect):
-                if action == "done":
-                    self._ptest_stop_edit()
-                    self._ptest_save_config()
-                elif action == "mode":
-                    self._kb_mode = "cn" if self._kb_mode == "abc" else "abc"
-                elif action == "space":
-                    self._ptest_append_name(which, " ")
-                elif action == "back":
-                    self._ptest_backspace(which)
-                elif action.startswith("char:"):
-                    self._ptest_append_name(which, action[5:])
-                return
+        点「完成」按钮、或者用系统输入法按回车, 都走这里 —— 保证两条路行为完全一致
+        (之前按回车只退出不保存, 是个不一致的坑)。
+        """
+        try:
+            _vib_log("[NAME] 确认编辑 射手=%s 门将=%s"
+                     % (self._ptest_sname(), self._ptest_kname()))
+        except Exception:
+            pass
+        self._ptest_stop_edit()
+        self._ptest_save_config()
 
     # ===== 本地文件记忆(自建角色数值/名字/开关) =====
     def _ptest_config_path(self):
@@ -4434,14 +4451,19 @@ class Game:
         if ev.type == getattr(pygame, "TEXTINPUT", -99) and editing in ("s", "k"):
             txt = getattr(ev, "text", "") or ""
             _vib_log("[NAME] 收到 TEXTINPUT text=%r 编辑=%s" % (txt, editing))
+            # 部分输入法的"完成/换行"会以文本形式上屏(\n 或 \r):
+            # 换行前的内容照常输入, 遇到换行即视为确认(等同按回车)。
             for ch in txt:
+                if ch in ("\n", "\r"):
+                    self._ptest_finish_edit()
+                    return
                 self._ptest_append_name(editing, ch)
             return
         if ev.type == pygame.KEYDOWN:
             if editing in ("s", "k"):
-                # 名字编辑态: 桌面键盘走 KEYDOWN.unicode 兜底, 回车确认, 退格删除
-                if ev.key == pygame.K_RETURN:
-                    self._ptest_stop_edit()
+                # 名字编辑态: 回车=确认并保存(等同点「完成」), 退格删除, ESC取消
+                if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self._ptest_finish_edit()
                 elif ev.key == pygame.K_BACKSPACE:
                     self._ptest_backspace(editing)
                 elif ev.key == pygame.K_ESCAPE:
@@ -4460,7 +4482,8 @@ class Game:
             _vib_log("[PTEST] 点击 pos=%s 命中=%s 编辑中=%s"
                      % (tuple(int(p) for p in ev.pos),
                         self._ptest_which(ev.pos), editing))
-            # 编辑态: 名字框可切换编辑对象; 软键盘区域交给 _handle_keyboard
+            # 编辑态: 名字由手机系统输入法输入(TEXTINPUT)。
+            # 这里只处理"切换编辑对象"和"完成"; 其它区域一律忽略, 避免误触。
             if editing in ("s", "k"):
                 if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
                     self._ptest_start_edit("s")
@@ -4468,12 +4491,11 @@ class Game:
                 if self._point_in_rect(ev.pos, self._ptest_kname_rect()):
                     self._ptest_start_edit("k")
                     return
-                # 软键盘面板内 -> 处理键盘按键(否则编辑中点击其它区域忽略,
-                # 避免误触被键盘挡住的控件)
-                if self._point_in_rect(ev.pos, self._kb_panel_rect()):
-                    self._handle_keyboard(ev)
+                if self._point_in_rect(ev.pos, self._ptest_done_rect()):
+                    self._ptest_finish_edit()
+                    return
                 return
-            # 未编辑: 点名字框进入编辑(弹出内置软键盘)
+            # 未编辑: 点名字框进入编辑(v1.20: 唤起手机系统输入法)
             if self._point_in_rect(ev.pos, self._ptest_sname_rect()):
                 self._ptest_start_edit("s")
                 return
