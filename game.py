@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.18"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.19"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -292,6 +292,209 @@ def _vib_log(msg):
                 fh.write(line + "\n")
         except Exception:
             pass
+
+
+# ===== 通用结构化日志 v1.19 =====
+# 目的: 真机出问题时能拿到"足够定位"的信息, 而不只是"震动没反应/点了没反应"。
+#   - 内存环形缓冲 -> 开发者模块现场可看
+#   - 手机外部存储 app_debug.log -> 用户可上传给我们分析
+#   - 级别: I=信息 W=警告 E=错误
+LOG_LINES = []
+LOG_MAX = 400
+LOG_FILE = "app_debug.log"
+
+
+def _log(tag, msg, level="I"):
+    """写一条日志(内存缓冲 + 手机文件)。任何情况下都不允许抛异常影响游戏。"""
+    try:
+        import time as _t
+        line = "[%s][%s][%s] %s" % (_t.strftime("%H:%M:%S"), level, tag, msg)
+        LOG_LINES.append(line)
+        if len(LOG_LINES) > LOG_MAX:
+            del LOG_LINES[:len(LOG_LINES) - LOG_MAX]
+        # 同时塞进旧的震动日志缓冲, 让开发者模块"最近日志"一栏也能看到全部内容
+        try:
+            _vib_log_lines.append(line)
+            if len(_vib_log_lines) > 200:
+                _vib_log_lines[:] = _vib_log_lines[-200:]
+        except Exception:
+            pass
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                f = PythonActivity.mActivity.getExternalFilesDir(None)
+                with open(f.getAbsolutePath() + "/" + LOG_FILE, "a",
+                          encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception:
+                pass
+        return line
+    except Exception:
+        return ""
+
+
+def _log_err(tag, msg):
+    return _log(tag, msg, "E")
+
+
+def _log_exc(tag, e):
+    """记录异常(带堆栈), 用来取代散落各处的 except: pass(否则真错被完全掩盖)。"""
+    try:
+        import traceback as _tb
+        return _log(tag, "%r\n%s" % (e, _tb.format_exc()), "E")
+    except Exception:
+        return ""
+
+
+def _install_excepthook():
+    """把未捕获的崩溃写进日志 —— 真机闪退后否则一点线索都没有。"""
+    import sys as _sys
+    import traceback as _tb
+
+    def _hook(etype, value, tb):
+        try:
+            _log("CRASH", "%s: %s\n%s" % (
+                getattr(etype, "__name__", etype), value,
+                "".join(_tb.format_exception(etype, value, tb))), "E")
+        except Exception:
+            pass
+        try:
+            _sys.__excepthook__(etype, value, tb)
+        except Exception:
+            pass
+
+    try:
+        _sys.excepthook = _hook
+    except Exception:
+        pass
+
+
+_install_excepthook()
+
+
+def _export_log():
+    """把内存里的日志导出成一份完整文件, 返回路径。
+
+    用途: 玩家在真机遇到问题时, 到开发者模块点「导出日志」, 把这个文件发给我们,
+    就能拿到设备信息 + 状态轨迹 + 输入统计 + 崩溃堆栈, 不用再靠截图猜。
+    """
+    try:
+        import time as _t
+        name = "dqls_log_%s.txt" % _t.strftime("%Y%m%d_%H%M%S")
+        if IS_ANDROID:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            d = PythonActivity.mActivity.getExternalFilesDir(None).getAbsolutePath()
+        else:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "local_data")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+        p = os.path.join(d, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(LOG_LINES))
+        _log("LOG", "已导出日志 -> %s (%d 行)" % (p, len(LOG_LINES)))
+        return p
+    except Exception as e:
+        _log_exc("LOG", e)
+        return ""
+
+
+# ===================================================================
+# 可调参数 v1.19(开发者模块 -> 「调参数」)
+# ===================================================================
+# 设计底线: 每一项的**默认值都等于改动前代码里写死的那个数**。
+# 也就是说玩家不去动它, 游戏行为和改动前 100% 一致, 不会因为加了可调功能就变味。
+# (key, 显示名, 默认值, 最小, 最大, 步长, 单位)
+PARAM_DEFS = [
+    ("vib_goal_ms",     "震动·重炮进球",   500,   0,  3000,  50,   "ms"),
+    ("vib_save_ms",     "震动·扑出重炮",   200,   0,  3000,  50,   "ms"),
+    ("vib_test_ms",     "震动·测试按钮",   320,   0,  3000,  50,   "ms"),
+    ("dedup_window_s",  "触摸·去重时间窗", 0.3,  0.0, 2.0,   0.05, "s"),
+    ("dedup_dist_px",   "触摸·去重距离",   100,   0,   400,   10,   "px"),
+    ("power_speed",     "玩法·重炮判定球速", 25,  5,    60,    1,   "m/s"),
+    ("shake_amp",       "画面·震屏幅度",   11,    0,    40,    1,   "px"),
+]
+# 默认值快照(重置时用)
+PARAM_DEFAULT = {k: v for k, _n, v, _lo, _hi, _s, _u in PARAM_DEFS}
+# 当前生效值
+PARAMS = dict(PARAM_DEFAULT)
+
+
+def _param(key):
+    """读取可调参数; 取不到就回落到默认值, 任何异常都不许影响游戏运行。"""
+    try:
+        return PARAMS.get(key, PARAM_DEFAULT.get(key))
+    except Exception:
+        return PARAM_DEFAULT.get(key)
+
+
+def _params_path():
+    """可调参数的持久化路径(与 ptest 配置同目录, 单独一个文件)。"""
+    try:
+        if IS_ANDROID:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            d = PythonActivity.mActivity.getExternalFilesDir(None).getAbsolutePath()
+        else:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "local_data")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+        return os.path.join(d, "dev_params.json")
+    except Exception:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dev_params.json")
+
+
+def _params_save():
+    try:
+        import json as _json
+        with open(_params_path(), "w", encoding="utf-8") as fh:
+            _json.dump(PARAMS, fh, ensure_ascii=False)
+        _log("PARAM", "已保存可调参数")
+        return True
+    except Exception as e:
+        _log_exc("PARAM", e)
+        return False
+
+
+def _params_reset():
+    """全部恢复默认值。"""
+    try:
+        for k, _n, v, _lo, _hi, _s, _u in PARAM_DEFS:
+            PARAMS[k] = v
+        _log("PARAM", "已重置为默认值")
+        return True
+    except Exception as e:
+        _log_exc("PARAM", e)
+        return False
+
+
+def _params_load():
+    """启动时载入上次调过的参数(带范围钳制, 防止手改文件写出离谱值)。"""
+    try:
+        import json as _json
+        p = _params_path()
+        if not os.path.exists(p):
+            return
+        with open(p, "r", encoding="utf-8") as fh:
+            data = _json.load(fh) or {}
+        for k, _n, dflt, lo, hi, _s, _u in PARAM_DEFS:
+            if k in data:
+                try:
+                    v = type(dflt)(data[k])
+                    PARAMS[k] = max(lo, min(hi, v))
+                except Exception:
+                    pass
+        _log("PARAM", "已载入可调参数")
+    except Exception as e:
+        _log_exc("PARAM", e)
 
 
 _VIB = {
@@ -1152,6 +1355,7 @@ class State(Enum):
     MENU = auto()
     HELP = auto()                # 操作说明页面
     DEV = auto()                 # 开发者模块(震动自检/日志等诊断内容)
+    DEV_PARAMS = auto()          # 可调参数(v1.19: 震动/触摸/玩法/画面 数值实时可调)
     PLAYER_TEST = auto()         # 球员测试(自建角色 -> 加入选卡第5/6张)
     SELECT_STRIKER = auto()
     SELECT_KEEPER = auto()
@@ -1242,13 +1446,21 @@ class Game:
         self.screen = self._init_display()
         self._win_w, self._win_h = self._window_size()
         pygame.display.set_caption(f"{APP_NAME} v{VERSION} - 3D 点球大战")
+        # 注: 启动环境日志(BOOT, 含 scale/偏移)放在 _present_cap 之后, 见下方。
         self.clock = pygame.time.Clock()
 
         # 恢复上次「球员测试」自建角色(名字/数值/开关)—— 见 _ptest_load_config
         try:
             self._ptest_load_config()
-        except Exception:
-            pass
+        except Exception as e:
+            # v1.19: 原来是 pass, 加载失败会被彻底掩盖
+            _log_exc("PTEST", e)
+
+        # v1.19: 恢复上次调过的可调参数(震动时长/去重窗口/重炮判定/震屏幅度)
+        try:
+            _params_load()
+        except Exception as e:
+            _log_exc("PARAM", e)
 
         # 触摸输入管线状态(见 handle_event):
         # 手机端 SDL 把一次触摸同时送成 FINGERDOWN 和"合成的" MOUSEBUTTONDOWN。
@@ -1259,6 +1471,11 @@ class Game:
         self._last_finger_pos = (0.0, 0.0)
         self._last_mouse_t = 0.0
         self._last_mouse_pos = (0.0, 0.0)
+        # v1.19 输入诊断计数(开发者模块可见, 用于判断真机是否真的有"双投递"):
+        #   finger     = 收到的真手指按下次数
+        #   mouse      = 走到最后、被当成真实点击处理的鼠标按下次数(安卓上 >0 说明有合成鼠标)
+        #   dedup_drop = 被去重正确丢弃的合成鼠标次数
+        self._input_stat = {"finger": 0, "mouse": 0, "dedup_drop": 0}
         if SEED is not None:
             random.seed(SEED)
 
@@ -1307,6 +1524,19 @@ class Game:
         self._update_ok = True      # display.update(rect) 是否可用(老设备退回 flip)
         self._fps_target = FPS      # 当前帧率目标
         self._adapt_t = 0.0         # 上次调整至今的时间
+
+        # v1.19: 启动环境日志。必须放在 _present_cap 之后 —— _scale_factor()
+        # 依赖它, 放太早会抛 AttributeError(之前放在这里之前导致 BOOT 日志丢失)。
+        # scale/ox/oy 是真机"点不准/点不动/跳屏"的第一手证据。
+        try:
+            _sc, _ox, _oy = self._scale_factor()
+            _log("BOOT", "APP v%s 窗口=%sx%s 画布=%sx%s scale=%.4f ox=%.1f "
+                         "oy=%.1f pygame=%s IS_ANDROID=%s" % (
+                             VERSION, self._win_w, self._win_h, WIDTH, HEIGHT,
+                             _sc, _ox, _oy,
+                             getattr(pygame, "__version__", "?"), IS_ANDROID))
+        except Exception:
+            pass
 
         # 游戏状态
         self.state = State.MENU
@@ -1803,10 +2033,32 @@ class Game:
             # 这台设备已确认走手指通道, 真鼠标事件必是合成副本 -> 去重丢弃
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 now = time.time()
+                # v1.19 修复(坐标空间不一致): 原来直接拿"窗口像素"的 ev.pos
+                # 与 "_last_finger_pos(画布坐标)" 相比 —— 两者坐标系不同,
+                # 100px 阈值失真。真机上同一次触摸的合成鼠标可能被判成
+                # "不同位置"而没被丢弃, 于是同一次点击被处理两遍(跳屏/双击)。
+                # 这里先换算到画布坐标再比, 与下方"双向去重"保持一致。
                 lx, ly = self._last_finger_pos
-                dx = abs(ev.pos[0] - lx)
-                dy = abs(ev.pos[1] - ly)
-                if (now - self._last_finger_t) < 0.3 and dx < 100 and dy < 100:
+                # 两种坐标解释都算一遍, 只要有一种判定为"同一次触摸"就丢弃。
+                # 因为我们无法确定合成鼠标到底是"窗口像素"还是"已是画布坐标":
+                #   - 若是窗口像素 -> 必须换算后才能和 _last_finger_pos 比
+                #   - 若已是画布坐标 -> 不能再换算(再换算反而失真, 会漏去重)
+                # 取 OR 可以同时覆盖两种情况, 任一命中即丢弃, 不会漏也不会误伤。
+                try:
+                    _mx, _my = self._to_canvas_pos(ev.pos)
+                except Exception:
+                    _mx, _my = ev.pos[0], ev.pos[1]
+                # v1.19: 去重窗口与距离改为可调(默认 0.3s / 100px, 与改动前一致)
+                _dd = _param("dedup_dist_px")
+                _dw = _param("dedup_window_s")
+                near_raw = (abs(ev.pos[0] - lx) < _dd and
+                            abs(ev.pos[1] - ly) < _dd)
+                near_canvas = (abs(_mx - lx) < _dd and abs(_my - ly) < _dd)
+                if (now - self._last_finger_t) < _dw and (near_raw or near_canvas):
+                    try:
+                        self._input_stat["dedup_drop"] += 1
+                    except Exception:
+                        pass
                     return
             else:
                 # 鼠标移动/抬起也来自合成, 直接丢弃(避免 hover 抖动/重复抬起)
@@ -1827,12 +2079,19 @@ class Game:
                 if IS_ANDROID:
                     now = time.time()
                     lx, ly = self._last_mouse_pos
-                    if ((now - self._last_mouse_t) < 0.3 and
-                            abs(cpos[0] - lx) < 100 and abs(cpos[1] - ly) < 100):
+                    _dd = _param("dedup_dist_px")
+                    _dw = _param("dedup_window_s")
+                    if ((now - self._last_mouse_t) < _dw and
+                            abs(cpos[0] - lx) < _dd and abs(cpos[1] - ly) < _dd):
                         return
                 # 记录手指来源, 供"合成鼠标"去重比对
                 self._last_finger_t = time.time()
                 self._last_finger_pos = (float(cpos[0]), float(cpos[1]))
+                # v1.19 诊断计数(开发者模块可见): 真手指事件数
+                try:
+                    self._input_stat["finger"] += 1
+                except Exception:
+                    pass
                 ev = pygame.event.Event(pygame.MOUSEBUTTONDOWN,
                                         pos=cpos, button=1)
             elif ev.type == FINGERMOTION:
@@ -1863,6 +2122,13 @@ class Game:
             if IS_ANDROID and ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 self._last_mouse_t = time.time()
                 self._last_mouse_pos = (float(ev.pos[0]), float(ev.pos[1]))
+                # v1.19 诊断计数: 走到这里说明"没被去重丢弃"的鼠标事件。
+                # 安卓上若这个数 > 0, 说明确实有合成鼠标事件在被当成真实点击处理
+                # (配合 dedup_drop 一起看, 就能判断真机到底有没有双投递)。
+                try:
+                    self._input_stat["mouse"] += 1
+                except Exception:
+                    pass
 
         if ev.type == pygame.MOUSEMOTION:
             self.mouse_pos = ev.pos
@@ -1898,6 +2164,8 @@ class Game:
             self._handle_help(ev)
         elif self.state == State.DEV:
             self._handle_dev(ev)
+        elif self.state == State.DEV_PARAMS:
+            self._handle_dev_params(ev)
         elif self.state == State.PLAYER_TEST:
             self._handle_player_test(ev)
         elif self.state == State.SELECT_STRIKER:
@@ -2493,6 +2761,15 @@ class Game:
     # ----------------------------------------------------------------
     def update(self, dt: float):
         self.state_t += dt
+        # v1.19: 记录状态机切换轨迹。真机"卡在某个页面不动/跳屏"时,
+        # 日志里能直接看出是从哪一步跳到哪一步、在哪一步停留了多久。
+        try:
+            if self.state != getattr(self, "_last_logged_state", None):
+                prev = getattr(self, "_last_logged_state", None)
+                _log("STATE", "%s -> %s" % (prev, self.state))
+                self._last_logged_state = self.state
+        except Exception:
+            pass
         if self.cooldown > 0:
             self.cooldown = max(0.0, self.cooldown - dt)
 
@@ -2981,7 +3258,8 @@ class Game:
             self.match_stats["max_ball_speed"] = self.last_ball_speed
         skill_used = self._shot_skill != "normal"
         # v1.06: "超大力射门"统计口径改为 到达门线速度>=25 的所有射门
-        is_power = self.last_ball_speed >= 25.0
+        # v1.19: "重炮/大力"的判定球速改为可调(默认 25, 与改动前一致)
+        is_power = self.last_ball_speed >= _param("power_speed")
         if self.attacker_is_player:
             # 玩家射门 -> 结果归玩家; 被扑出 = AI 门将扑救 +1
             self.match_stats["player_shots"] += 1
@@ -3018,21 +3296,23 @@ class Game:
         if oc == "GOAL":
             if is_power:                     # 大力进球: 来电式强震
                 self.shake_t = max(self.shake_t, 0.45)
-                self.shake_amp = max(self.shake_amp, 11)
+                # v1.19: 震屏幅度 / 震动时长改为可调(默认 11 / 500, 与改动前一致)
+                self.shake_amp = max(self.shake_amp, _param("shake_amp"))
                 if IS_ANDROID:
-                    _android_vibrate(500)
+                    _android_vibrate(int(_param("vib_goal_ms")))
             else:                            # 普通进球: 不震动
                 _VIB["skip"] += 1
         elif oc == "SAVE":
             if is_power:                     # 扑出的是大力射门 -> 200ms(用户要求0.2s)
                 if IS_ANDROID:
-                    _android_vibrate(200)
+                    # v1.19: 默认 200ms(用户要求的 0.2s), 现可在「调参数」里改
+                    _android_vibrate(int(_param("vib_save_ms")))
             else:                            # 普通扑救: 不震动
                 _VIB["skip"] += 1
         # 记录关键事件
         event_text = ""
         if self.last_outcome == "GOAL":
-            if self.last_ball_speed >= 25:
+            if self.last_ball_speed >= _param("power_speed"):
                 event_text = f"R{self.round_num} {'玩家' if self.attacker_is_player else 'AI'}重炮进球 {self.last_ball_speed:.0f}m/s"
             else:
                 event_text = f"R{self.round_num} {'玩家' if self.attacker_is_player else 'AI'}进球"
@@ -3171,6 +3451,8 @@ class Game:
             self._draw_help(screen)
         elif self.state == State.DEV:
             self._draw_dev(screen)
+        elif self.state == State.DEV_PARAMS:
+            self._draw_dev_params(screen)
         elif self.state == State.PLAYER_TEST:
             self._draw_player_test(screen)
         elif self.state == State.SELECT_STRIKER:
@@ -3391,7 +3673,24 @@ class Game:
                                        True, (170, 170, 170))
                 screen.blit(t, (panel_x + 24, y))
 
-        # 按钮: 清日志 / 球员测试 / 返回
+        # v1.19 诊断信息: 真机排查"点不动/跳屏"的关键指标。
+        # 合成鼠标 > 0 表示确实有"同一次触摸被投递两遍"的情况。
+        try:
+            st = getattr(self, "_input_stat", {})
+            _sc, _ox, _oy = self._scale_factor()
+            info = ("输入: 手指=%d 合成鼠标=%d 去重丢弃=%d    scale=%.3f ox=%.0f oy=%.0f"
+                    % (st.get("finger", 0), st.get("mouse", 0),
+                       st.get("dedup_drop", 0), _sc, _ox, _oy))
+            t = self.font_s.render(info, True, (150, 220, 255))
+            screen.blit(t, (panel_x + 24, panel_y + panel_h - 44))
+            _dm = getattr(self, "_dev_msg", "")
+            hint = _dm if _dm else "点「导出日志」可把完整日志发给我们分析"
+            t2 = self.font_s.render(hint, True, (140, 190, 210))
+            screen.blit(t2, (panel_x + 24, panel_y + panel_h - 24))
+        except Exception:
+            pass
+
+        # 按钮: 清日志 / 球员测试 / 导出日志 / 返回
         # (「测试震动」按钮已整合进「球员测试」页, 见 _ptest_vib_rect)
         r2 = self._dev_clear_rect()
         h2 = self._point_in_rect(self.mouse_pos, r2)
@@ -3400,18 +3699,32 @@ class Game:
         rp = self._dev_ptest_rect()
         hp = self._point_in_rect(self.mouse_pos, rp)
         self._draw_button(screen, rp, "球员测试", hover=hp, active=hp)
+        re_ = self._dev_export_rect()
+        he = self._point_in_rect(self.mouse_pos, re_)
+        self._draw_button(screen, re_, "导出日志", hover=he, active=he)
+        r4 = self._dev_params_rect()
+        h4 = self._point_in_rect(self.mouse_pos, r4)
+        self._draw_button(screen, r4, "调参数", hover=h4, active=h4)
         r3 = self._dev_back_rect()
         h3 = self._point_in_rect(self.mouse_pos, r3)
         self._draw_button(screen, r3, "返回菜单", hover=h3)
 
+    # v1.19: 5 个按钮, 统一 140 宽(每个占 ±70)。
+    # 中心点 -320 / -160 / 0 / +160 / +320, 间距 160 > 140, 互不重叠且都在面板(±450)内。
     def _dev_clear_rect(self):
-        return self._button_rect(WIDTH // 2 - 320, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 - 320, HEIGHT - 60, 140, 46)
 
     def _dev_ptest_rect(self):
-        return self._button_rect(WIDTH // 2 - 105, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 - 160, HEIGHT - 60, 140, 46)
+
+    def _dev_params_rect(self):
+        return self._button_rect(WIDTH // 2, HEIGHT - 60, 140, 46)
+
+    def _dev_export_rect(self):
+        return self._button_rect(WIDTH // 2 + 160, HEIGHT - 60, 140, 46)
 
     def _dev_back_rect(self):
-        return self._button_rect(WIDTH // 2 + 110, HEIGHT - 60, 200, 46)
+        return self._button_rect(WIDTH // 2 + 320, HEIGHT - 60, 140, 46)
 
     def _handle_dev(self, ev):
         if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE,
@@ -3427,9 +3740,156 @@ class Game:
                 self.state = State.PLAYER_TEST
                 self.state_t = 0.0
                 return
+            # v1.19: 导出完整日志(发给开发者分析)
+            if self._point_in_rect(ev.pos, self._dev_export_rect()):
+                _p = _export_log()
+                self._dev_msg = ("已导出: %s" % _p) if _p else "导出失败(详见日志)"
+                return
+            # v1.19: 进入可调参数页
+            if self._point_in_rect(ev.pos, self._dev_params_rect()):
+                self.state = State.DEV_PARAMS
+                self.state_t = 0.0
+                return
             if self._point_in_rect(ev.pos, self._dev_back_rect()):
                 self.state = State.MENU
                 self.state_t = 0.0
+
+    # =================================================================
+    # 可调参数页 v1.19(开发者模块 -> 「调参数」)
+    # =================================================================
+    # 参数定义见模块级 PARAM_DEFS。默认值 = 改动前的硬编码值, 不动就完全等同旧行为。
+    _PARAM_COL_X = WIDTH // 2 - 60      # +/- 按钮列起点(行整体落在面板内)
+    _PARAM_ROW_Y0 = 150
+    _PARAM_ROW_STEP = 70
+
+    @staticmethod
+    def _param_step(key):
+        for k, _n, _d, _lo, _hi, s, _u in PARAM_DEFS:
+            if k == key:
+                return s
+        return 1
+
+    @staticmethod
+    def _param_fmt(v, step, unit):
+        """按步长决定显示精度: 浮点步长显示小数, 整数步长显示整数。"""
+        try:
+            if isinstance(step, float) and step < 1:
+                s = ("%.2f" % float(v)).rstrip("0").rstrip(".")
+            else:
+                s = str(int(v))
+        except Exception:
+            s = str(v)
+        return ("%s %s" % (s, unit)) if unit else s
+
+    def _param_rows(self):
+        """[(key, 显示名, 当前值, 单位, minus, val, plus), ...] 供绘制与点击共用。"""
+        out = []
+        y = self._PARAM_ROW_Y0
+        for key, name, _dflt, _lo, _hi, _step, unit in PARAM_DEFS:
+            minus, val, plus = self._ptest_row_rects(self._PARAM_COL_X, y)
+            out.append((key, name, _param(key), unit, minus, val, plus))
+            y += self._PARAM_ROW_STEP
+        return out
+
+    def _param_click_row(self, pos):
+        """处理 +/-: 按步长调整并钳制在 [最小, 最大] 内。返回是否命中。"""
+        y = self._PARAM_ROW_Y0
+        for key, _name, _dflt, lo, hi, step, _unit in PARAM_DEFS:
+            minus, _val, plus = self._ptest_row_rects(self._PARAM_COL_X, y)
+            try:
+                cur = _param(key)
+                nv = None
+                if self._point_in_rect(pos, minus):
+                    nv = cur - step
+                elif self._point_in_rect(pos, plus):
+                    nv = cur + step
+                if nv is not None:
+                    nv = max(lo, min(hi, nv))
+                    if isinstance(step, float) and step < 1:
+                        nv = round(nv, 3)      # 避免浮点累积误差
+                    else:
+                        nv = int(nv)
+                    PARAMS[key] = nv
+                    _log("PARAM", "%s: %s -> %s" % (key, cur, nv))
+                    return True
+            except Exception as e:
+                _log_exc("PARAM", e)
+            y += self._PARAM_ROW_STEP
+        return False
+
+    def _param_save_rect(self):
+        return self._button_rect(WIDTH // 2 - 220, HEIGHT - 60, 200, 46)
+
+    def _param_reset_rect(self):
+        return self._button_rect(WIDTH // 2, HEIGHT - 60, 200, 46)
+
+    def _param_back_rect(self):
+        return self._button_rect(WIDTH // 2 + 220, HEIGHT - 60, 200, 46)
+
+    def _draw_dev_params(self, screen):
+        self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
+        panel_x, panel_y = WIDTH // 2 - 450, 60
+        panel_w, panel_h = 900, 620
+        pygame.draw.rect(screen, PANEL, (panel_x, panel_y, panel_w, panel_h),
+                         border_radius=14)
+        pygame.draw.rect(screen, GOLD, (panel_x, panel_y, panel_w, panel_h), 2,
+                         border_radius=14)
+        title = self.font_l.render("可调参数(即时生效)", True, GOLD)
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, panel_y + 18))
+        tip = self.font_s.render(
+            "默认即原版数值; 改完点「保存」才会记住, 否则重启回到默认",
+            True, (190, 200, 210))
+        screen.blit(tip, (WIDTH // 2 - tip.get_width() // 2, panel_y + 62))
+
+        for key, name, val, unit, minus, vrect, plus in self._param_rows():
+            hm = self._point_in_rect(self.mouse_pos, minus)
+            hp = self._point_in_rect(self.mouse_pos, plus)
+            self._draw_button(screen, minus, "-", hover=hm, active=hm)
+            self._draw_button(screen, plus, "+", hover=hp, active=hp)
+            # 参数名画在左侧, 数值画在中间数值区(各占一块, 不会挤在一起)
+            tn = self.font_m.render(name, True, WHITE)
+            screen.blit(tn, (panel_x + 24,
+                             vrect[1] + vrect[3] // 2 - tn.get_height() // 2))
+            step = self._param_step(key)
+            tv = self.font_m.render(self._param_fmt(val, step, unit), True, GOLD)
+            screen.blit(tv, (vrect[0] + vrect[2] // 2 - tv.get_width() // 2,
+                             vrect[1] + vrect[3] // 2 - tv.get_height() // 2))
+
+        msg = getattr(self, "_param_msg", "")
+        if msg:
+            mt = self.font_s.render(msg, True, (150, 235, 150))
+            screen.blit(mt, (WIDTH // 2 - mt.get_width() // 2,
+                             panel_y + panel_h - 40))
+
+        rs = self._param_save_rect()
+        hs = self._point_in_rect(self.mouse_pos, rs)
+        self._draw_button(screen, rs, "保存", hover=hs, active=hs)
+        rr = self._param_reset_rect()
+        hr = self._point_in_rect(self.mouse_pos, rr)
+        self._draw_button(screen, rr, "恢复默认", hover=hr, active=hr)
+        rb = self._param_back_rect()
+        hb = self._point_in_rect(self.mouse_pos, rb)
+        self._draw_button(screen, rb, "返回", hover=hb)
+
+    def _handle_dev_params(self, ev):
+        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE,):
+            self.state = State.DEV
+            self.state_t = 0.0
+            return
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if self._param_click_row(ev.pos):
+                return
+            if self._point_in_rect(ev.pos, self._param_save_rect()):
+                self._param_msg = "已保存" if _params_save() else "保存失败(见日志)"
+                return
+            if self._point_in_rect(ev.pos, self._param_reset_rect()):
+                self._param_msg = "已恢复默认" if _params_reset() else "重置失败(见日志)"
+                return
+            if self._point_in_rect(ev.pos, self._param_back_rect()):
+                self.state = State.DEV
+                self.state_t = 0.0
+                return
 
     # ----- 球员测试(自建角色 -> 选卡界面第5射手/第6门将) -----
     # 数值直接存在 Game 实例上(进页面就能改, 生成后立即生效)
@@ -3687,11 +4147,16 @@ class Game:
                 removed = True
             self._tester_striker_obj = None
             self._tester_keeper_obj = None
-            self._card_cache.clear()
-            self.selected_striker_idx = min(self.selected_striker_idx,
-                                            len(STRIKERS) - 1)
-            self.selected_keeper_idx = min(self.selected_keeper_idx,
-                                           len(KEEPERS) - 1)
+            # v1.19: _ptest_load_config 在 __init__ 里调用得很早, 那时
+            # _card_cache / selected_*_idx 还没创建(见 __init__ 顺序),
+            # 直接访问会抛 AttributeError 并被 except 吞掉。改用 getattr 兜底。
+            _cc = getattr(self, "_card_cache", None)
+            if _cc is not None:
+                _cc.clear()
+            self.selected_striker_idx = min(
+                getattr(self, "selected_striker_idx", 0), len(STRIKERS) - 1)
+            self.selected_keeper_idx = min(
+                getattr(self, "selected_keeper_idx", 0), len(KEEPERS) - 1)
             self._ptest_msg = "已移出自建卡, 恢复原定角色" if removed \
                 else "开关为否: 选卡保持原定角色"
             return
@@ -3734,12 +4199,15 @@ class Game:
             msgs.append("门将已加入(第6张)")
         self._tester_keeper_obj = ckp
         # 卡片缓存全部失效(尺寸/内容都可能变)
-        self._card_cache.clear()
+        # v1.19: 同样用 getattr 兜底(早于 __init__ 完成时被调用的情况)
+        _cc = getattr(self, "_card_cache", None)
+        if _cc is not None:
+            _cc.clear()
         # 防止选中索引越界
-        self.selected_striker_idx = min(self.selected_striker_idx,
-                                        len(STRIKERS) - 1)
-        self.selected_keeper_idx = min(self.selected_keeper_idx,
-                                       len(KEEPERS) - 1)
+        self.selected_striker_idx = min(
+            getattr(self, "selected_striker_idx", 0), len(STRIKERS) - 1)
+        self.selected_keeper_idx = min(
+            getattr(self, "selected_keeper_idx", 0), len(KEEPERS) - 1)
         self._ptest_msg = "  ".join(msgs)
 
     def _ptest_start_edit(self, which):
@@ -3894,14 +4362,20 @@ class Game:
                 pass
         return os.path.join(d, "ptest_config.json")
 
-    def _ptest_truncate(self, name):
-        """名字按显示宽度(汉字=2)截断到上限 8."""
+    def _ptest_truncate(self, name, default="自建射手"):
+        """名字按显示宽度(汉字=2)截断到上限 8.
+
+        v1.19 修复: 原来兜底名写死成"自建射手", 但这个函数射手和门将都在用
+        (见 _ptest_load_config), 导致"门将名被清空后重启"会显示成"自建射手"。
+        现在由调用方传入各自正确的默认名(射手->自建射手 / 门将->自建门将),
+        与 _ptest_generate 里的兜底逻辑保持一致。
+        """
         out = ""
         for ch in (name or ""):
             if self._name_disp_width(out + ch) > 8:
                 break
             out += ch
-        return out or "自建射手"
+        return out or default
 
     def _ptest_save_config(self):
         """把自建角色(名字/数值/开关)写入本地文件, 下次启动自动恢复."""
@@ -3930,10 +4404,11 @@ class Game:
                 return
             with open(p, "r", encoding="utf-8") as fh:
                 data = _json.load(fh)
+            # v1.19: 明确传各自默认名, 避免门将兜底成"自建射手"(见 _ptest_truncate)
             self._tester_s_name = self._ptest_truncate(
-                str(data.get("s_name", "自建射手")))
+                str(data.get("s_name", "自建射手")), "自建射手")
             self._tester_k_name = self._ptest_truncate(
-                str(data.get("k_name", "自建门将")))
+                str(data.get("k_name", "自建门将")), "自建门将")
             ss = data.get("s_stats", {}) or {}
             self._tester_striker = {
                 "power": max(1, min(10, int(ss.get("power", 7)))),
@@ -3949,8 +4424,9 @@ class Game:
             self._tester_on = bool(data.get("on", False))
             if self._tester_on:
                 self._ptest_generate()
-        except Exception:
-            pass
+        except Exception as e:
+            # v1.19: 原来是 pass —— 真实加载失败会被完全掩盖, 永远查不到原因
+            _log_exc("PTEST", e)
 
     def _handle_player_test(self, ev):
         editing = getattr(self, "_ptest_editing", None)
@@ -4006,7 +4482,7 @@ class Game:
                 return
             # 测试震动(从开发者模块整合进来; 仅手机有意义)
             if IS_ANDROID and self._point_in_rect(ev.pos, self._ptest_vib_rect()):
-                _android_vibrate(320)
+                _android_vibrate(int(_param("vib_test_ms")))
                 return
             # 开关: 是 <-> 否 (即时生效: 是=加入, 否=移除; 同时持久化)
             if self._point_in_rect(ev.pos, self._ptest_toggle_rect()):
