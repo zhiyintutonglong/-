@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.20"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.21"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -159,8 +159,10 @@ BALL_COLOR = (252, 252, 252)
 BALL_SEAM = (35, 35, 38)
 CLOUD = (252, 252, 255)
 CLOUD_SHADOW = (220, 228, 240)
-STAND_COLOR = (70, 78, 88)
-STAND_DARK = (55, 62, 72)
+# 看台改为偏蓝的灰蓝, 避免 STAND_DARK 太暗在"草地-天空"交界(球门/地平线一带)
+# 看起来像一条黑带。用户明确要求黑色间隔"用绿色或蓝色填充"。
+STAND_COLOR = (126, 144, 166)
+STAND_DARK = (100, 118, 142)
 TRAIL_COLOR = (255, 230, 120)
 WHITE = (255, 255, 255)
 BLACK = (24, 24, 28)
@@ -503,11 +505,12 @@ def _params_load():
 # 同时走两条路(SDL 文本输入 + JNI InputMethodManager), 并把每条路的结果写日志,
 # 万一你的机器拉不起来, 导出日志就能看出是哪一步失败。
 def _ime_show():
-    """唤起手机系统输入法。返回实际生效的方式列表(也写日志)。"""
+    """唤起手机系统输入法(用户默认的正常键盘)。返回实际生效的方式列表。"""
     if not IS_ANDROID:
         return "desktop"
     got = []
-    # 1) SDL 文本输入: SDL2 在安卓上会去唤 IME, 同时决定收不收 TEXTINPUT
+    # 1) SDL 文本输入(主路径): SDL 会用系统默认的普通键盘, 并投递 TEXTINPUT。
+    #    这是最干净的方式, 不会触发部分国产 ROM 的"隐私/安全键盘"。
     try:
         sti = getattr(pygame.key, "start_text_input", None)
         if sti:
@@ -515,7 +518,9 @@ def _ime_show():
             got.append("sdl_start_text_input")
     except Exception as e:
         _log_exc("IME", e)
-    # 2) JNI: 让当前窗口拿到焦点后强制弹输入法(兜底)
+    # 2) JNI 兜底: 仅用 SHOW_IMPLICIT 唤起"用户默认的正常键盘"。
+    #    不再用 toggleSoftInput(SHOW_FORCED) —— 那会使部分 ROM 强制弹出
+    #    隐私/安全键盘; 也不再让视图进入"触摸可聚焦"模式(同样易触发安全输入)。
     try:
         from jnius import autoclass
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
@@ -524,7 +529,6 @@ def _ime_show():
         imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
         view = activity.getWindow().getDecorView()
         try:
-            view.setFocusableInTouchMode(True)
             view.requestFocus()
         except Exception:
             pass
@@ -533,11 +537,6 @@ def _ime_show():
             got.append("imm_showSoftInput")
         except Exception as e:
             _log_exc("IME", e)
-        try:
-            imm.toggleSoftInput(imm.SHOW_FORCED, 0)
-            got.append("imm_toggleSoftInput")
-        except Exception:
-            pass
     except Exception as e:
         _log_exc("IME", e)
     _log("IME", "唤起系统输入法 -> %s" % (", ".join(got) or "全部失败"))
@@ -1577,6 +1576,13 @@ class Game:
         self._scale_dest_ok = True                           # scale() 是否支持目标 surface 参数
         self._overlay: Optional[pygame.Surface] = None       # 复用的全屏遮罩
         self._num_cache = {}                                 # 队号数字(按字号缓存)
+        # 云的初始布局与漂移速度(px/s); 每帧由 _draw_clouds_animated 让它们浮动
+        self._clouds = [
+            (100, 60, 70, 22, 6.0), (280, 40, 90, 26, 4.5),
+            (480, 75, 60, 20, 7.5), (680, 50, 80, 24, 5.0),
+            (900, 65, 65, 21, 6.5), (1080, 45, 75, 23, 4.0),
+            (1200, 80, 55, 18, 8.0),
+        ]
         self._effect_font_cache = {}                         # GOAL/SAVE 大字(按字号缓存)
         self._card_cache = {}                                # 球员卡片(按 索引+选中态 缓存)
 
@@ -2120,10 +2126,8 @@ class Game:
                 #   - 若是窗口像素 -> 必须换算后才能和 _last_finger_pos 比
                 #   - 若已是画布坐标 -> 不能再换算(再换算反而失真, 会漏去重)
                 # 取 OR 可以同时覆盖两种情况, 任一命中即丢弃, 不会漏也不会误伤。
-                try:
-                    _mx, _my = self._to_canvas_pos(ev.pos)
-                except Exception:
-                    _mx, _my = ev.pos[0], ev.pos[1]
+                # 合成鼠标 ev.pos 已是 1280x800 逻辑坐标, 直接用(不要再经 _to_canvas_pos)
+                _mx, _my = ev.pos[0], ev.pos[1]
                 # v1.19: 去重窗口与距离改为可调(默认 0.3s / 100px, 与改动前一致)
                 _dd = _param("dedup_dist_px")
                 _dw = _param("dedup_window_s")
@@ -2142,11 +2146,11 @@ class Game:
 
         already_canvas = False
         if is_finger:
-            # 触屏给的是 0~1 的归一化坐标, 必须乘"窗口真实像素尺寸"——
-            # SCALED 模式下 screen.get_size() 是 1280x800 的逻辑尺寸,
-            # 乘它的话黑边区域会被算进去, 点击整体偏移。
-            tw, th = self._win_w, self._win_h
-            cpos = self._to_canvas_pos((ev.x * tw, ev.y * th))
+            # 触屏给的是 0~1 归一化坐标。pygame SCALED 模式下 SDL 会把触摸坐标
+            # 归一化到逻辑窗口尺寸(1280x800), 直接乘逻辑尺寸即得画布坐标,
+            # 不要再经 _to_canvas_pos(那是给"真实像素"用的, 再换算会二次缩放
+            # 导致中心虽准、越往边缘偏移越大的问题 —— 即"按钮位置不重合")。
+            cpos = (ev.x * WIDTH, ev.y * HEIGHT)
             already_canvas = True
             if ev.type == FINGERDOWN:
                 # 极少数设备会"先发合成鼠标、后发手指"。若这次手指紧挨着最近一次
@@ -2185,11 +2189,11 @@ class Game:
             try:
                 if ev.type == pygame.MOUSEMOTION:
                     ev = pygame.event.Event(
-                        ev.type, pos=self._to_canvas_pos(ev.pos),
+                        ev.type, pos=ev.pos,
                         rel=ev.rel, buttons=ev.buttons)
                 else:
                     ev = pygame.event.Event(
-                        ev.type, pos=self._to_canvas_pos(ev.pos),
+                        ev.type, pos=ev.pos,
                         button=ev.button)
             except Exception:
                 pass
@@ -3573,19 +3577,19 @@ class Game:
         # 只清黑边: 中间区域马上会被整块覆盖, 没必要每帧全屏 fill 一遍
         bx, by = (tw - dw) // 2, (th - dh) // 2
         if self._present_rect != (bx, by, dw, dh):
-            target.fill((0, 0, 0))      # 尺寸变了(自适应画质调档)才整屏清, 防残留
+            target.fill((96, 165, 235))      # 尺寸变了(自适应画质调档)才整屏清, 防残留
             self._present_rect = (bx, by, dw, dh)
         else:
             top, bottom = by, th - dh - by
             left, right = bx, tw - dw - bx
             if top > 0:
-                target.fill((0, 0, 0), (0, 0, tw, top))
+                target.fill((96, 165, 235), (0, 0, tw, top))
             if bottom > 0:
-                target.fill((0, 0, 0), (0, th - bottom, tw, bottom))
+                target.fill((96, 165, 235), (0, th - bottom, tw, bottom))
             if left > 0:
-                target.fill((0, 0, 0), (0, top, left, dh))
+                target.fill((96, 165, 235), (0, top, left, dh))
             if right > 0:
-                target.fill((0, 0, 0), (tw - right, top, right, dh))
+                target.fill((96, 165, 235), (tw - right, top, right, dh))
         if (dw, dh) == (WIDTH, HEIGHT):
             target.blit(canvas, ((tw - dw) // 2, (th - dh) // 2))
             return
@@ -3643,6 +3647,7 @@ class Game:
     def _draw_help(self, screen):
         """操作说明页面."""
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.7, WIDTH, HEIGHT * 0.3))
         # 标题
         title = self.font_xl.render("操作说明", True, WHITE)
@@ -3713,6 +3718,7 @@ class Game:
     def _draw_dev(self, screen):
         """开发者模块: 集中放所有震动自检与诊断反馈(已移出操作说明页)."""
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
         panel_x, panel_y = WIDTH // 2 - 450, 60
         panel_w, panel_h = 900, 620
@@ -3909,6 +3915,7 @@ class Game:
 
     def _draw_dev_params(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
         panel_x, panel_y = WIDTH // 2 - 450, 60
         panel_w, panel_h = 900, 620
@@ -4038,6 +4045,7 @@ class Game:
 
     def _draw_player_test(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.42, WIDTH, HEIGHT * 0.58))
         title = self.font_l.render("球员测试 - 铸造新角色", True, WHITE)
         screen.blit(title, (WIDTH // 2 - 260 - title.get_width() // 2, 24))
@@ -4468,8 +4476,9 @@ class Game:
                     self._ptest_backspace(editing)
                 elif ev.key == pygame.K_ESCAPE:
                     self._ptest_stop_edit()
-                elif ev.unicode and ev.unicode.isprintable():
-                    # TEXTINPUT 已处理输入的场合不会到这里(桌面端用它兜底)
+                elif not IS_ANDROID and ev.unicode and ev.unicode.isprintable():
+                    # 桌面端用 KEYDOWN.unicode 兜底(无 TEXTINPUT);
+                    # 安卓端 TEXTINPUT 已处理输入, 这里若再追加会"打一个出两个"
                     self._ptest_append_name(editing, ev.unicode)
                 return
             if ev.key in (pygame.K_ESCAPE,):
@@ -4584,6 +4593,7 @@ class Game:
         self._warmup()
         # 渐变背景
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         # 草地
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.62, WIDTH, HEIGHT * 0.38))
         # 远处的球门
@@ -4646,6 +4656,7 @@ class Game:
     # ----- 选择射门球员 -----
     def _draw_select_striker(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.65, WIDTH, HEIGHT * 0.35))
         title = self.font_l.render("选择你的射门球员 (1/2)", True, WHITE)
         screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 50))
@@ -4671,6 +4682,7 @@ class Game:
 
     def _draw_select_keeper(self, screen):
         self._draw_gradient_bg(screen, SKY_TOP, SKY_MID)
+        self._draw_clouds_animated(screen)
         pygame.draw.rect(screen, GRASS_A, (0, HEIGHT * 0.65, WIDTH, HEIGHT * 0.35))
         title = self.font_l.render("选择你的守门员 (2/2)", True, WHITE)
         screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 50))
@@ -4822,6 +4834,8 @@ class Game:
             screen.blit(self._bg_cache, (0, 0))
             screen.blit(self._stands_cache, (ox, oy))
             screen.blit(self._grass_cache, (ox, oy))
+        # 飘动的云(画在天空区域, 远处的看台/球门之上不会有云压住它们)
+        self._draw_clouds_animated(screen)
         # 球门
         self._draw_goal(screen, ox, oy)
         # 守门员
@@ -4927,6 +4941,24 @@ class Game:
                 pygame.draw.ellipse(screen, CLOUD,
                     (cx + dx - r, cy + dy - r * 0.6, r * 2, r * 1.2))
 
+    def _draw_clouds_animated(self, screen):
+        """随时间横向飘动的云(游戏过程中浮动)。形状与 _draw_clouds 一致。"""
+        t = pygame.time.get_ticks() / 1000.0
+        span = WIDTH + 200
+        for (cx0, cy, w, h, spd) in self._clouds:
+            cx = (cx0 + t * spd) % span - 100
+            parts = [(-w * 0.35, 0, h * 0.85), (0, -h * 0.35, h * 1.0),
+                     (w * 0.35, 0, h * 0.85), (w * 0.15, h * 0.15, h * 0.7),
+                     (-w * 0.15, h * 0.1, h * 0.65)]
+            for dx, dy, r in parts:
+                pygame.draw.ellipse(screen, CLOUD_SHADOW,
+                                    (int(cx + dx - r), int(cy + dy - r * 0.6 + 2),
+                                     int(r * 2), int(r * 1.2)))
+            for dx, dy, r in parts:
+                pygame.draw.ellipse(screen, CLOUD,
+                                    (int(cx + dx - r), int(cy + dy - r * 0.6),
+                                     int(r * 2), int(r * 1.2)))
+
     def _draw_stands(self, screen, ox=0, oy=0):
         """画远处看台和观众."""
         z = GOAL_Z + 5.5
@@ -4991,9 +5023,12 @@ class Game:
         # 实际可见草地从 z≈3.5(画面底部) 到 z=∞(地平线≈画面中央)
         # 这里直接用固定分区: 天空0~38%, 看台38~42%, 草地42~100%
         grass_top = int(HEIGHT * 0.42)  # 草地从画面42%处开始
-        # 整片草地
+        # 草地-天空接缝兜底: 先在草地顶边上方铺一条"天蓝色"带(不被草地覆盖),
+        # 再让草地向上多盖 2px 与之重叠消除硬边。这样即便个别设备因四舍五入
+        # 在接缝处留 1px 缝, 露出的也是天蓝/草绿, 绝不会是黑色间隔。
+        pygame.draw.rect(screen, SKY_TOP, (0, grass_top - 6, WIDTH, 6))
         pygame.draw.rect(screen, GRASS_A,
-                         (0, grass_top, WIDTH, HEIGHT - grass_top))
+                         (0, grass_top - 2, WIDTH, HEIGHT - grass_top + 2))
         # 草地条纹(横条)
         for z in range(int(PENALTY_Z), int(GOAL_Z + 12), 1):
             z = float(z) + 0.0
@@ -5048,7 +5083,7 @@ class Game:
             return
         bg = pygame.Surface((WIDTH, HEIGHT))
         self._draw_gradient_bg(bg, SKY_TOP, SKY_MID)
-        self._draw_clouds(bg)
+        # 云改为每帧动态绘制(_draw_clouds_animated), 不再烘焙进静态缓存
         self._bg_cache = bg.convert()
 
         stands = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
