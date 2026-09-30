@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.22"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.23"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -198,6 +198,8 @@ MAGNUS_K = (0.5 * AIR_DENSITY * BALL_AREA * BALL_RADIUS
 GROUND_RESTITUTION = 0.55  # 草地反弹系数
 ROLL_DECEL = 4.0           # 贴地滚动减速度 m/s^2
 POST_RADIUS = 0.06         # 门柱半径 m
+# v1.23: "擦框险区"半径 —— 球掠过门框附近时按概率判定中框, 让中柱/中梁真正出现
+POST_GRAZE_R = 0.55        # 球心距门框结构 <= 0.55m 视为"擦框", 越近中框概率越高
 PHYS_DT = 1.0 / 240.0      # 物理积分子步长(固定步长保证可重复)
 # 出球速度 -> 到达门线速度 的典型衰减比(9m 飞行, 阻力吃掉约13%)
 SPEED_DECAY = 0.87
@@ -250,14 +252,133 @@ def cell_rect(cell: int):
 #   * 0疲劳 / 50%力度时: 詹姆斯25, 杰瑞21, 兔同笼21, 牢二24 (m/s).
 #   * 詹姆斯"超大力"技能 + 满体力100力度 → 约 60 m/s.
 #   * 加入 ±8% 概率浮动, 让每次射门略有差异.
-SPD_SLOPE = 15.0                       # 力度条每 +100% 增加的出球速度
-SPD_LO = {7: 13.5, 8: 16.5, 9: 17.5}  # 0力度时的基础速度(按力量属性区分)
+# (v1.23 起球速改为按"力量档位"查表, 见下方 SPD_LO_TBL / SPD_SLOPE_TBL。
+#  旧的 SPD_LO / SPD_SLOPE 单一兜底常量已废弃删除, 请勿再引用。)
 POWER_SHOT_BOOST = 1.846              # 超大力技能倍率(詹姆斯满力 ≈ 60 m/s)
+
+# ====================================================================
+# v1.23 属性档位表 —— 射手三属性 / 门将三属性, 全部建成 1~10 显式表
+# --------------------------------------------------------------------
+# 背景: 之前只有 SPD_LO 定义了 7/8/9 三档, 其余档位一律走
+#   只有 7/8/9 三档有定义, 其余档位一律落到 15.0 的兜底值 —— 于是自定义球员
+#   "力量1 = 力量6 = 力量10", 力量属性形同虚设(用户反馈的问题)。
+# 现在每个属性都建 1~10 全表: 数值单调、档位差异可感, 且集中在一处便于微调。
+# 预设球员手感锚点保持不变(力量7=13.5 / 8=16.5 / 9=17.5, 50%力度仍是 21/24/25)。
+# ====================================================================
+# [射手] 力量档位 -> 0 力度时的基础球速(m/s)
+SPD_LO_TBL = {1: 6.0, 2: 7.5, 3: 9.0, 4: 10.5, 5: 12.0, 6: 12.8,
+              7: 13.5, 8: 16.5, 9: 17.5, 10: 20.0}
+# [射手] 力量档位 -> 力度条斜率(力度每 +100% 增加的球速), 力量越大蓄力收益越高
+SPD_SLOPE_TBL = {1: 9.0, 2: 10.5, 3: 11.5, 4: 12.5, 5: 13.5, 6: 14.0,
+                 7: 15.0, 8: 15.5, 9: 16.5, 10: 18.0}
+# [射手] 准度档位 -> 落点噪声幅度(越大越飘); 准度10 仍留极小偏差(不存在100%必进)
+ACC_NOISE = {1: 0.90, 2: 0.78, 3: 0.66, 4: 0.55, 5: 0.45, 6: 0.36,
+             7: 0.28, 8: 0.20, 9: 0.13, 10: 0.07}
+# [射手] 准度档位 -> 落点质量(打得准=贴死角, 门将更难扑); 乘在门将扑救概率上
+ACC_PLACE = {1: 1.21, 2: 1.17, 3: 1.13, 4: 1.08, 5: 1.04, 6: 1.00,
+             7: 0.96, 8: 0.92, 9: 0.87, 10: 0.83}
+# [射手] 准度档位 -> 大力射门的额外偏差惩罚系数(越大越吃亏)
+ACC_BIGPOWER = {1: 0.76, 2: 0.72, 3: 0.68, 4: 0.64, 5: 0.60, 6: 0.56,
+                7: 0.52, 8: 0.48, 9: 0.44, 10: 0.40}
+# [射手] 力量档位 -> 对门将的压制系数(力量越大门将越难扑); 乘在扑救概率上
+POW_PRESSURE = {1: 1.09, 2: 1.07, 3: 1.04, 4: 1.02, 5: 1.00, 6: 0.98,
+                7: 0.96, 8: 0.93, 9: 0.91, 10: 0.89}
+# [射手] 心理档位 -> 疲劳增量缩放(越小越抗疲劳)
+COMPOSE_FATIGUE = {1: 0.99, 2: 0.95, 3: 0.91, 4: 0.87, 5: 0.83, 6: 0.79,
+                   7: 0.75, 8: 0.71, 9: 0.67, 10: 0.63}
+# [射手] 心理档位 -> 加时赛/关键时刻的偏差缩减比例
+COMPOSE_CLUTCH = {1: 0.02, 2: 0.05, 3: 0.08, 4: 0.11, 5: 0.14, 6: 0.17,
+                  7: 0.20, 8: 0.23, 9: 0.26, 10: 0.30}
+# [门将] 反应档位 -> 起跳延迟(秒)
+KEEPER_DELAY = {1: 0.47, 2: 0.44, 3: 0.41, 4: 0.38, 5: 0.35, 6: 0.32,
+                7: 0.29, 8: 0.26, 9: 0.23, 10: 0.20}
+# [门将] 臂展档位 -> 相邻格覆盖系数(直接乘在臂展扑救项上)
+REACH_COVER = {1: 0.05, 2: 0.06, 3: 0.07, 4: 0.13, 5: 0.22, 6: 0.33,
+               7: 0.46, 8: 0.61, 9: 0.79, 10: 1.00}
+# [门将] 扑救档位 -> 同格(非四角)扑救能力
+DIVE_POWER = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40, 5: 0.50, 6: 0.60,
+              7: 0.70, 8: 0.80, 9: 0.90, 10: 1.00}
+# [门将] 反应档位 -> 四角球扑救能力
+REFLEX_POWER = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40, 5: 0.50, 6: 0.60,
+                7: 0.70, 8: 0.80, 9: 0.90, 10: 1.00}
+# [门将] 通用属性因子(1~10) —— 用于各场景的加权修正
+ATTR_FACTOR = {1: 0.64, 2: 0.68, 3: 0.72, 4: 0.76, 5: 0.80, 6: 0.84,
+               7: 0.88, 8: 0.92, 9: 0.96, 10: 1.00}
+
+# 力度系数下限(v1.23 提高): 旧值 0.3 会把"轻推"的偏差乘掉 70%, 于是
+# "准度1 轻轻一推也很准"。抬高到 0.55, 低准度在软射门下照样飘。
+POWER_FACTOR_MIN = 0.55
+
+
+def _clamp_attr(v):
+    """属性值夹到 1~10 的整数(自定义球员/异常数据兜底)。"""
+    try:
+        i = int(round(float(v)))
+    except Exception:
+        i = 5
+    return max(1, min(10, i))
+
+
+def _tbl(table, v, default):
+    return table.get(_clamp_attr(v), default)
+
+
+def _spd_base(power):
+    return _tbl(SPD_LO_TBL, power, 15.0)
+
+
+def _spd_slope(power):
+    return _tbl(SPD_SLOPE_TBL, power, 15.0)
+
+
+def _acc_noise(acc):
+    return _tbl(ACC_NOISE, acc, 0.45)
+
+
+def _acc_place(acc):
+    return _tbl(ACC_PLACE, acc, 1.00)
+
+
+def _acc_bigpower(acc):
+    return _tbl(ACC_BIGPOWER, acc, 0.60)
+
+
+def _pow_pressure(power):
+    return _tbl(POW_PRESSURE, power, 1.00)
+
+
+def _compose_fatigue(c):
+    return _tbl(COMPOSE_FATIGUE, c, 0.83)
+
+
+def _compose_clutch(c):
+    return _tbl(COMPOSE_CLUTCH, c, 0.14)
+
+
+def _keeper_delay(reflex):
+    return _tbl(KEEPER_DELAY, reflex, 0.35)
+
+
+def _reach_cover(reach):
+    return _tbl(REACH_COVER, reach, 0.30)
+
+
+def _dive_power(dive):
+    return _tbl(DIVE_POWER, dive, 0.50)
+
+
+def _reflex_power(reflex):
+    return _tbl(REFLEX_POWER, reflex, 0.50)
+
+
+def _attr_factor(v):
+    return _tbl(ATTR_FACTOR, v, 0.80)
+
 
 def _shot_speed(frac, attr, fatigue, skill=False):
     # 计算射门出球速度(已含疲劳衰减与概率浮动).
     f = max(0.0, min(1.0, frac))
-    base = SPD_LO.get(attr, 15.0) + SPD_SLOPE * f
+    base = _spd_base(attr) + _spd_slope(attr) * f
     base *= random.uniform(0.92, 1.08)                 # 概率浮动
     if fatigue > 0:
         base *= (1.0 - fatigue * 0.04)                 # 疲劳降速(加强后)
@@ -2018,7 +2139,7 @@ class Game:
         sp_power = self.striker_profile.power if self.attacker_is_player else (
             self.ai_striker_profile.power if self.ai_striker_profile else 8)
         # 估算出球速度, 再乘以空气阻力衰减 = 到达门线时的真实速度
-        est_speed = (SPD_LO.get(sp_power, 15.0) + SPD_SLOPE * power) * SPEED_DECAY
+        est_speed = (_spd_base(sp_power) + _spd_slope(sp_power) * power) * SPEED_DECAY
         if est_speed < 19.0:
             return "weak", "弱力", GREEN, "球速慢 - 反应时间充足, 相邻格也能靠臂展扑到"
         elif est_speed < 23.5:
@@ -2036,7 +2157,7 @@ class Game:
             power = self.power_value
         sp_power = self.striker_profile.power if self.attacker_is_player else (
             self.ai_striker_profile.power if self.ai_striker_profile else 8)
-        return (SPD_LO.get(sp_power, 15.0) + SPD_SLOPE * power) * SPEED_DECAY
+        return (_spd_base(sp_power) + _spd_slope(sp_power) * power) * SPEED_DECAY
 
     def _adjacent_save_prob(self, speed: float = None) -> float:
         """门将选到相邻格(臂展覆盖)时的扑救成功率 - 臂展越长越高, 球越慢越高."""
@@ -2045,16 +2166,16 @@ class Game:
             speed = self._est_ball_speed()
         # 放宽到覆盖全部真实球速(12~52 m/s), 弱力档内也随球速平滑变化, 不再饱和成同一概率
         slow = max(0.0, min(1.0, (SLOW_HI - speed) / (SLOW_HI - SLOW_LO)))
-        reach_n = max(0.30, kp.reach / 10.0)
-        p = (0.02 + slow * 0.48) * (reach_n ** 2.2)
-        rf = 0.6 + 0.04 * kp.reach
-        ref_f = 0.6 + 0.04 * kp.reflex
-        df = 0.6 + 0.04 * kp.dive
+        reach_n = _reach_cover(kp.reach)
+        p = (0.02 + slow * 0.48) * reach_n
+        rf = _attr_factor(kp.reach)
+        ref_f = _attr_factor(kp.reflex)
+        df = _attr_factor(kp.dive)
         p *= (ref_f * 0.15 + rf * 0.70 + df * 0.15)
         # 与实际判定 _resolve_outcome 保持同一套系数, 避免界面估算误导玩家
         sp = self.ai_striker_profile if self.ai_striker_profile else STRIKERS[0]
-        p *= max(0.80, 1.0 - (sp.power - 5) * 0.022)
-        p *= 1.0 - (sp.accuracy - 6) * 0.042
+        p *= _pow_pressure(sp.power)
+        p *= _acc_place(sp.accuracy)
         return max(0.0, min(1.0, p))
 
     # ----------------------------------------------------------------
@@ -2631,18 +2752,18 @@ class Game:
 
         if is_precision:
             power = min(power, 0.6)
-            noise_amp = 0.12
+            noise_amp = _acc_noise(sp.accuracy) * 0.30
             self.precision_shot_used = True
             self.player_skill_charge = 0
         elif is_power_shot:
             power = 1.3
             # 超大力: 准度控制偏差(accuracy越高偏差越小)
             # v1.09: 技能生效时略微提高精准度(偏差再降 15%)
-            noise_amp = (1.0 - sp.accuracy / 10.0) * 0.6 * 0.85
+            noise_amp = _acc_noise(sp.accuracy) * 0.85
             self.player_skill_charge = 0
         else:
             # 普通射门: 准度控制偏差(accuracy越高偏差越小)
-            noise_amp = (1.0 - sp.accuracy / 10.0) * 0.6
+            noise_amp = _acc_noise(sp.accuracy)
         # 记录本次射门"实际生效"的技能(赛后统计只认真正生效的, 不被按钮状态误导)
         if is_power_shot:
             self._shot_skill = "power_shot"
@@ -2654,18 +2775,18 @@ class Game:
             self._shot_skill = "normal"
         # 心理(composure): 加时赛准度加成
         if self.is_overtime:
-            ot_bonus = sp.composure / 10.0 * 0.15  # composure10->偏差减15%
+            ot_bonus = _compose_clutch(sp.composure)  # 心理档位 -> 关键时刻偏差缩减
             noise_amp *= (1.0 - ot_bonus)
         # 疲劳增加偏差
         fatigue_penalty = self.player_fatigue * 0.14
         noise_amp += fatigue_penalty
         # 力度系数
-        power_factor = 0.3 + 0.7 * min(1.0, power)
+        power_factor = POWER_FACTOR_MIN + (1.0 - POWER_FACTOR_MIN) * min(1.0, power)
         # 大力射门偏差: 准度高的球员大力球偏差惩罚更小
         if power > 0.7:
             big_power_penalty = (power - 0.7) / 0.3
             # 准度10->惩罚系数0.4, 准度5->惩罚系数0.8
-            acc_mod = 0.8 - sp.accuracy * 0.04
+            acc_mod = _acc_bigpower(sp.accuracy)
             noise_amp *= (1 + big_power_penalty * acc_mod)
         dev_x = random.gauss(0, 1.5 * noise_amp * power_factor)
         dev_y = random.gauss(0, 1.2 * noise_amp * power_factor)
@@ -2735,7 +2856,7 @@ class Game:
             target_x = self.keeper.target_x
             target_y = self.keeper.target_y
         # 反应延迟(秒) - reflex 6->0.32s, reflex 10->0.20s
-        reaction_delay = 0.50 - 0.030 * kp.reflex
+        reaction_delay = _keeper_delay(kp.reflex)
         self.keeper.target_x = target_x
         self.keeper.target_y = target_y
         self.keeper.committed = True
@@ -2776,24 +2897,24 @@ class Game:
             self.ai_skill_charge = 0
             self.ai_precision_used = True
         # 准度控制偏差(与玩家一致)
-        noise_amp = (1.0 - ai_sp.accuracy / 10.0) * 0.6
+        noise_amp = _acc_noise(ai_sp.accuracy)
         if ai_skill == "power_shot":
             # 超大力偏差略增; v1.09: 技能生效时略提精准度, 故从 1.2 降到 1.05
             noise_amp *= 1.05
         elif ai_skill == "precision":
-            noise_amp = 0.12  # 超精准: 偏差暴降至12%
+            noise_amp = _acc_noise(ai_sp.accuracy) * 0.30  # 超精准: 偏差暴降(仍按准度分档)
         # 心理: 加时赛准度加成
         if self.is_overtime:
-            ot_bonus = ai_sp.composure / 10.0 * 0.15
+            ot_bonus = _compose_clutch(ai_sp.composure)
             noise_amp *= (1.0 - ot_bonus)
         # 疲劳增加偏差
         fatigue_penalty = self.ai_fatigue * 0.14
         noise_amp += fatigue_penalty
-        power_factor = 0.3 + 0.7 * min(1.0, power)
+        power_factor = POWER_FACTOR_MIN + (1.0 - POWER_FACTOR_MIN) * min(1.0, power)
         # 大力射门偏差: 准度影响惩罚系数
         if power > 0.7:
             big_power_penalty = (power - 0.7) / 0.3
-            acc_mod = 0.8 - ai_sp.accuracy * 0.04
+            acc_mod = _acc_bigpower(ai_sp.accuracy)
             noise_amp *= (1 + big_power_penalty * acc_mod)
         dev_x = random.gauss(0, 1.5 * noise_amp * power_factor)
         dev_y = random.gauss(0, 1.2 * noise_amp * power_factor)
@@ -2858,6 +2979,24 @@ class Game:
             self._update_ball_fly(dt)
         elif self.state == State.ROUND_RESULT:
             self.result_t += dt
+            # v1.23: 门框反弹 —— 中框后球要真正弹回场内(旧版设了速度却没跑物理)
+            if getattr(self, "_frame_rebound", False) and self.ball.active:
+                b = self.ball
+                _rem = min(dt, 0.12)
+                while _rem > 1e-6:
+                    _h = min(PHYS_DT, _rem)
+                    _pos = [b.x, b.y, b.z]
+                    _vel = [b.vx, b.vy, b.vz]
+                    step_ball(_pos, _vel, getattr(b, "spin_rate", 0.0), _h)
+                    b.x, b.y, b.z = _pos
+                    b.vx, b.vy, b.vz = _vel
+                    _rem -= _h
+                    if b.y <= BALL_RADIUS + 0.05 and abs(b.vy) < 1.0:
+                        break
+                # 弹回场内后落地/出界即停, 并清标记(下一球复用)
+                if b.y <= BALL_RADIUS + 0.06 or abs(b.x) > GOAL_W / 2 + 8 or b.z > GOAL_Z + 8 or b.z < 0.2:
+                    b.active = False
+                    self._frame_rebound = False
             # v1.09: 让门将把扑救动作完整做完(平滑落位到所选格子, 不瞬移).
             # 球速太快被破防时, 此时可能还没到位 —— 也保持连贯继续扑, 最终自然停在所选格.
             if getattr(self.keeper, "committed", False):
@@ -3055,6 +3194,7 @@ class Game:
         """球到达球门线时判定结果 - 新属性分工系统."""
         self._break_defense = False
         self.save_fail_reason = ""
+        self._frame_rebound = False  # v1.23: 门框反弹标记(每球重置)
         # 记住球到达门线时的速度(用于进球后惯性滑入网兜)
         _arrive_vz = self.ball.vz
         _arrive_vx = self.ball.vx
@@ -3067,20 +3207,40 @@ class Game:
         in_goal = (-GOAL_W / 2 <= bx <= GOAL_W / 2) and (0 <= by <= GOAL_H)
         if not in_goal:
             self.last_outcome = "MISS"
-            # 打在门框上? (球半径 + 门柱半径)
-            hit_frame = (
-                abs(abs(bx) - GOAL_W / 2) <= BALL_RADIUS + POST_RADIUS
-                or abs(by - GOAL_H) <= BALL_RADIUS + POST_RADIUS
-            ) and abs(bx) <= GOAL_W / 2 + 0.5 and by <= GOAL_H + 0.5
+            # v1.23 门框判定增强:
+            #   旧版只在"球心恰好落在 0.17m 窄带"才判中框, 几乎不触发;
+            #   新版算"球心到门框结构的距离", 并加"擦框险区"概率, 让中柱/中梁真正出现。
+            #   门框结构: 左柱 x=-3.66 / 右柱 x=+3.66 (竖线 y∈[0,GOAL_H]), 横梁 y=GOAL_H (横线 |x|<=GOAL_W/2)
+            _hit_r = BALL_RADIUS + POST_RADIUS     # 物理接触半径(必然中框)
+            _graze_r = POST_GRAZE_R                 # 擦框险区(按概率中框)
+            _post_x = min(abs(bx - (-GOAL_W / 2)), abs(bx - GOAL_W / 2))
+            _d_post = _post_x if (0.0 <= by <= GOAL_H) else 1e9
+            _d_bar = abs(by - GOAL_H) if abs(bx) <= GOAL_W / 2 else 1e9
+            _d_frame = min(_d_post, _d_bar)
+            hit_frame = False
+            if _d_frame <= _hit_r:
+                hit_frame = True
+            elif _d_frame <= _graze_r:
+                # 险区: 越近中框概率越高(把中柱率从几乎0提升到可感水平)
+                _t = (_graze_r - _d_frame) / (_graze_r - _hit_r)
+                if random.random() < 0.10 + 0.55 * _t:
+                    hit_frame = True
             if hit_frame:
                 self.last_result_text = ("打中门框!" if self.attacker_is_player
                                          else "AI打中门框!")
-                # 门柱门框反弹: 球以射门速度反弹回去
-                _rebound_speed = max(8.0, abs(self.ball.vz))
-                self.ball.active = True  # 重新激活球让物理引擎继续跑
-                self.ball.vz = -_rebound_speed  # 反向飞回
-                self.ball.vx = self.ball.vx * 0.6 + random.uniform(-2.0, 2.0)
-                self.ball.vy = max(2.0, self.ball.vy * 0.5 + 3.0)  # 弹高一点
+                # v1.23: 记下反弹标记, 让 ROUND_RESULT 阶段继续跑球物理
+                # (旧版这里设了速度, 但因为状态立即切走、物理不再更新, 反弹"看不出来")
+                self._frame_rebound = True
+                _rb = max(8.0, abs(self.ball.vz) * random.uniform(0.35, 0.55))
+                self.ball.active = True
+                self.ball.vz = -_rb                        # 反向飞回场内
+                if _d_post <= _d_bar:
+                    # 撞门柱: 横向朝场内/外侧随机弹
+                    _side = 1.0 if bx > 0 else -1.0
+                    self.ball.vx = _side * random.uniform(1.0, 4.0)
+                else:
+                    self.ball.vx = self.ball.vx * 0.5
+                self.ball.vy = max(2.0, self.ball.vy * 0.5 + random.uniform(1.0, 4.0))
                 self.ball.net_roll_t = 0.0
                 self.ball.net_roll_vz = 0.0
             else:
@@ -3160,7 +3320,8 @@ class Game:
         self._slow_factor = slow_factor
 
         if dir_correct:
-            save_power = (kp.reflex if ball_is_corner else kp.dive) / 10.0
+            save_power = (_reflex_power(kp.reflex) if ball_is_corner
+                          else _dive_power(kp.dive))
             attr_type = "reflex" if ball_is_corner else "dive"
             # 距离因子: 离中间下方(8号)格子越远, 门将到位越慢, 快球越容易被破防
             # (贴合真实足球: 中下是门将起始位, 扑向两翼/上角要挪更远)
@@ -3181,8 +3342,8 @@ class Game:
             # 臂展覆盖相邻格: 臂展是主导因素(指数加成), 球速越慢整体越高
             # 慢球: 臂展10≈42% / 臂展8≈24% / 臂展6≈12% / 臂展5≈8%
             # 快球: 无论臂展都基本扑不到(<5%)
-            reach_n = max(0.30, kp.reach / 10.0)
-            base_prob = (0.02 + slow_factor * 0.48) * (reach_n ** 2.2)
+            reach_n = _reach_cover(kp.reach)
+            base_prob = (0.02 + slow_factor * 0.48) * reach_n
             attr_type = "reach"
         else:
             attr_type = "none"
@@ -3199,9 +3360,9 @@ class Game:
         base_prob *= speed_factor
 
         # 7. 属性修正(各属性独立因子, 权重按场景分配)
-        reflex_factor = 0.6 + 0.04 * kp.reflex
-        reach_factor = 0.6 + 0.04 * kp.reach
-        dive_factor = 0.6 + 0.04 * kp.dive
+        reflex_factor = _attr_factor(kp.reflex)
+        reach_factor = _attr_factor(kp.reach)
+        dive_factor = _attr_factor(kp.dive)
         if is_adjacent:
             # 相邻格: 臂展权重最大
             attr_factor = (reflex_factor * 0.15 + reach_factor * 0.70 + dive_factor * 0.15)
@@ -3216,10 +3377,10 @@ class Game:
         base_prob *= attr_factor
 
         # 射手力量越大, 门将越难挡(但收益递减, 保证力量型不会无敌)
-        power_factor = max(0.80, 1.0 - (sp_power - 5) * 0.022)
+        power_factor = _pow_pressure(sp_power)
         # 射手准度: 打得准的人把球送进格子边角(死角), 门将即便判断对方向
         # 也常常差那十几厘米; 打得飘的人落点随机, 平均更靠近门将够得到的区域
-        place_factor = 1.0 - (sp_acc - 6) * 0.042   # 准10->0.83, 准6->1.00, 准3->1.13
+        place_factor = _acc_place(sp_acc)   # 准10->0.83, 准6->1.00, 准3->1.13
         base_prob *= power_factor * place_factor
         # v1.09: 超大力射门技能生效时, 落点更精准刁钻 -> 扑救成功率再降一点点
         if self._shot_skill == "power_shot":
@@ -3411,7 +3572,7 @@ class Game:
             else:
                 fatigue_change = -2
             # composure高=心理优势=疲劳减缓(composure10减30%, composure7减21%)
-            fatigue_change *= (1.0 - sp.composure * 0.03)
+            fatigue_change *= _compose_fatigue(sp.composure)
             self.player_fatigue = max(0, min(10, self.player_fatigue + fatigue_change))
         else:
             ai_sp = self.ai_striker_profile if self.ai_striker_profile else random.choice(STRIKERS)
@@ -3426,7 +3587,7 @@ class Game:
                 fatigue_change = 2
             else:
                 fatigue_change = -2
-            fatigue_change *= (1.0 - ai_sp.composure * 0.03)
+            fatigue_change *= _compose_fatigue(ai_sp.composure)
             self.ai_fatigue = max(0, min(10, self.ai_fatigue + fatigue_change))
         self.power_shot_active = False
         self.selected_skill = "normal"
@@ -4672,7 +4833,7 @@ class Game:
             x, y, card_w, card_h = self._keeper_card_rect(i)
             sel = (i == self.selected_keeper_idx)
             # 综合扑救力(用于判断能否挡重力球)
-            save_power = (kp.reflex * 0.4 + kp.dive * 0.6) / 10.0
+            save_power = _reflex_power(kp.reflex) * 0.4 + _dive_power(kp.dive) * 0.6
             sp_color = GREEN if save_power >= 0.55 else RED
             screen.blit(self._cached_card(
                 ("K", i, sel, card_w), card_w, card_h,
