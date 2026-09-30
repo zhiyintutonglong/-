@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.23"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.24"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -305,6 +305,45 @@ REFLEX_POWER = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40, 5: 0.50, 6: 0.60,
 ATTR_FACTOR = {1: 0.64, 2: 0.68, 3: 0.72, 4: 0.76, 5: 0.80, 6: 0.84,
                7: 0.88, 8: 0.92, 9: 0.96, 10: 1.00}
 
+# ==================== v1.24 平衡调整常量(全部可调, 便于离线回归) ====================
+# A. 相邻格臂展覆盖细分:
+#    "仅角相邻"(斜对角, 无公共边, 曼哈顿距离=2) —— 门将必须横跨两格, 物理上几乎够不到
+#    "有边相邻"(有公共边, 曼哈顿距离=1)         —— 仍可顺势够到一部分
+ADJ_CORNER_MUL = 0.30        # 极大幅度削弱
+ADJ_EDGE_MUL = 0.85          # 小幅度削弱
+
+# B. 强球"来不及反应"的残值(反应1..10): 低反应几乎完全挡不住, 高反应还能凭本能挡一下
+NO_REACT_STRONG = {1: 0.02, 2: 0.04, 3: 0.06, 4: 0.08, 5: 0.10,
+                   6: 0.12, 7: 0.14, 8: 0.16, 9: 0.18, 10: 0.20}
+NO_REACT_OTHER = 0.25        # 中/弱球维持旧值(绝不能连续化, 否则低反应反而变强)
+# E. 强球反应惩罚连续化的时间常数(秒): 迟到 >= tau 才吃满残值惩罚。仅对强球生效。
+REACT_TAU_STRONG = 0.20
+
+# D. 四角强球的额外反应缩放(反应1 -> 反应10)
+CORNER_REFLEX_LO = 0.60
+CORNER_REFLEX_HI = 1.05
+
+# C. 强球破防阈值: 基础 0.55, 反应每低 1 点 +0.02(反应1->0.73, 反应10->0.55)
+BREAK_NEED_BASE = 0.55
+BREAK_NEED_PER_REFLEX = 0.02
+
+# F. 强球破防【连续化】(v1.24 新增, 用于拉开"远距离重炮下中低反应"的区分度):
+#    旧版是二值开关(effective_power < 阈值 -> x0.16, 否则 x0.85), 实测反应1~7 在重炮面前
+#    扑救率全是 0.3~0.7%, 完全没有梯度。新版按 ratio = effective_power / need 连续插值。
+BREAK_MUL_LO = 0.10          # ratio <= RATIO_LO : 完全被打穿
+BREAK_MUL_HI = 0.85          # ratio >= RATIO_HI : 完全扛住(与旧版"未破防"一致)
+BREAK_MUL_OLD_LO = 0.16      # 旧版二值开关的"破防"乘数(仅 BREAK_CONTINUOUS=False 时使用)
+BREAK_RATIO_LO = 0.10
+BREAK_RATIO_HI = 1.30
+# 曲线指数: >1 = 低反应一端更吃亏。这两个值是 NS=800/N=200 全量实测扫出来的:
+#   gamma 2.0 会让四角重炮下"反应9/10"的扑救率从 24.2/23.8 掉到 16.7/23.3(高反应被误伤),
+#   gamma 1.3 的梯度是 0.16→0.45→1.25→3.18→4.10→7.27→11.22(反应1~7),
+#   而反应8/9/10 基本保持 15.6/21.8/25.0(现状 14.8/24.2/23.8)。
+BREAK_GAMMA = 1.30
+BREAK_CONTINUOUS = True      # False = 退回 v1.23 的二值开关(仅用于离线 A/B 对照)
+BREAK_FLAG_AT = 0.35         # 乘数低于此值才判定为"破防"(影响文案与震屏)
+# ==================== v1.24 平衡调整常量结束 ====================
+
 # 力度系数下限(v1.23 提高): 旧值 0.3 会把"轻推"的偏差乘掉 70%, 于是
 # "准度1 轻轻一推也很准"。抬高到 0.55, 低准度在软射门下照样飘。
 POWER_FACTOR_MIN = 0.55
@@ -373,6 +412,51 @@ def _reflex_power(reflex):
 
 def _attr_factor(v):
     return _tbl(ATTR_FACTOR, v, 0.80)
+
+
+# ---------------- v1.24 平衡辅助函数(全部读取上面的模块级常量, 便于离线调参) ----------------
+def _adj_mul(ball_cell, keeper_cell):
+    """A. 相邻格细分: 仅角相邻(曼哈顿=2) vs 有边相邻(曼哈顿=1)。"""
+    br, bc = (int(ball_cell) - 1) // 3, (int(ball_cell) - 1) % 3
+    kr, kc = (int(keeper_cell) - 1) // 3, (int(keeper_cell) - 1) % 3
+    if abs(br - kr) + abs(bc - kc) >= 2:
+        return ADJ_CORNER_MUL
+    return ADJ_EDGE_MUL
+
+
+def _no_react_strong(reflex):
+    """B. 强球"来不及反应"的残值(反应1=0.02 ... 反应10=0.20)。"""
+    return _tbl(NO_REACT_STRONG, reflex, 0.10)
+
+
+def _corner_reflex_mul(reflex):
+    """D. 四角强球额外反应缩放(反应1=CORNER_REFLEX_LO ... 反应10=CORNER_REFLEX_HI)。"""
+    r = _clamp_attr(reflex)
+    return CORNER_REFLEX_LO + (CORNER_REFLEX_HI - CORNER_REFLEX_LO) * (r - 1) / 9.0
+
+
+def _break_need(reflex):
+    """C. 强球破防阈值: 反应越低要求越高(越容易被打穿)。"""
+    r = _clamp_attr(reflex)
+    return BREAK_NEED_BASE + BREAK_NEED_PER_REFLEX * (10 - r)
+
+
+def _break_mul(effective_power, need):
+    """F. 强球破防乘数【连续化】。
+    旧版二值开关让反应1~7 在重炮面前毫无区别; 新版按 ratio = effective_power / need
+    在 [BREAK_RATIO_LO, BREAK_RATIO_HI] 上做 gamma 曲线插值, 中低反应因此拉开梯度。
+    """
+    if not BREAK_CONTINUOUS:
+        return BREAK_MUL_OLD_LO if effective_power < need else BREAK_MUL_HI
+    if need <= 1e-6:
+        return BREAK_MUL_HI
+    ratio = effective_power / need
+    t = (ratio - BREAK_RATIO_LO) / (BREAK_RATIO_HI - BREAK_RATIO_LO)
+    if t <= 0.0:
+        return BREAK_MUL_LO
+    if t >= 1.0:
+        return BREAK_MUL_HI
+    return BREAK_MUL_LO + (BREAK_MUL_HI - BREAK_MUL_LO) * (t ** BREAK_GAMMA)
 
 
 def _shot_speed(frac, attr, fatigue, skill=False):
@@ -649,13 +733,195 @@ def _ime_show():
             got.append("sdl_start_text_input")
     except Exception as e:
         _log_exc("IME", e)
+    # v1.24: 读出 SDL 隐藏编辑框真正上报的 inputType。带 password 变体时国产 ROM
+    # (华为/鸿蒙/小米/OPPO/vivo) 会强制弹"安全键盘/隐私键盘", 这里发现就换真 EditText。
+    it = _ime_probe_input_type()
+    _vib_log("[IME] inputType=%s variation=%s password_like=%s err=%s"
+             % (it, _IME_STATE.get("variation"), _IME_STATE.get("password_like"),
+                _IME_STATE.get("err")))
+    if _IME_STATE.get("password_like"):
+        # 编译期补丁没打上(SDL 版本/路径不同) -> 停掉 SDL 通道, 改走真实 EditText,
+        # 保证玩家看到的是普通键盘(且能正常打中文)。
+        try:
+            stp = getattr(pygame.key, "stop_text_input", None)
+            if stp:
+                stp()
+        except Exception:
+            pass
+        got[:] = []
+        if _ime_edittext_show():
+            got.append("edittext_overlay")
+            _IME_STATE["mode"] = "edittext"
+        else:
+            # 兜底也失败 -> 退回 SDL(至少还能打英文), 并把原因写进日志
+            try:
+                sti = getattr(pygame.key, "start_text_input", None)
+                if sti:
+                    sti()
+                    got.append("sdl_fallback")
+            except Exception:
+                pass
+            _IME_STATE["mode"] = "sdl(password-like)"
+    else:
+        _IME_STATE["mode"] = "sdl"
     if not got:
-        _log("IME", "SDL 文本输入未生效(个别 ROM 可能拉不起键盘, 需反馈补安全兜底)")
+        _log("IME", "文本输入未生效(个别 ROM 可能拉不起键盘, 需反馈补安全兜底)")
     return got
 
 
+# v1.24: 运行时自检 + 兜底
+# 编译期补丁(_p4a_hook.py)会把 SDL 隐藏编辑框的 inputType 从 password 变体改成
+# NORMAL。但补丁有可能因为 SDL 版本/路径不同没打上, 所以这里在运行时把 SDL 真正
+# 上报给输入法的 inputType 读出来: 只要还带 password 变体, 就改用"真正的 EditText",
+# 保证玩家看到的是正常键盘而不是"安全键盘/隐私键盘"。
+_IME_STATE = {"mode": "-", "input_type": None, "variation": None,
+              "password_like": False, "err": None,
+              "et_view": None, "imm": None, "last": ""}
+# EditorInfo.inputType 里"变体"位掩码与几个密码变体的取值
+_TYPE_MASK_VARIATION = 0x00000FF0
+_TYPE_VARIATION_PASSWORD = (0x00000080,    # TYPE_TEXT_VARIATION_PASSWORD
+                            0x00000090,    # TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                            0x000000A0)    # TYPE_TEXT_VARIATION_WEB_PASSWORD
+
+
+def _ime_probe_input_type():
+    """读出 SDL 隐藏编辑框(DummyEdit)实际给输入法的 inputType。失败返回 None。"""
+    if not IS_ANDROID:
+        return None
+    try:
+        from jnius import autoclass
+        JavaClass = autoclass("java.lang.Class")
+        sdl = JavaClass.forName("org.libsdl.app.SDLActivity")
+        fld = sdl.getDeclaredField("mTextEdit")
+        fld.setAccessible(True)
+        edit = fld.get(None)
+        if edit is None:
+            _IME_STATE["err"] = "mTextEdit 为空(文本输入尚未创建)"
+            return None
+        EditorInfo = autoclass("android.view.inputmethod.EditorInfo")
+        ei = EditorInfo()
+        try:
+            edit.onCreateInputConnection(ei)
+        except Exception:
+            pass
+        it = int(ei.inputType)
+        var = it & _TYPE_MASK_VARIATION
+        _IME_STATE["input_type"] = it
+        _IME_STATE["variation"] = var
+        _IME_STATE["password_like"] = var in _TYPE_VARIATION_PASSWORD
+        return it
+    except Exception as e:
+        _IME_STATE["err"] = repr(e)
+        return None
+
+
+def _ime_edittext_show():
+    """兜底: 建一个真正的 EditText(普通文本类型)盖在界面底部并唤起输入法。"""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Context = autoclass("android.content.Context")
+        InputType = autoclass("android.text.InputType")
+        EditorInfo = autoclass("android.view.inputmethod.EditorInfo")
+        Gravity = autoclass("android.view.Gravity")
+        FrameLayout = autoclass("android.widget.FrameLayout")
+        Color = autoclass("android.graphics.Color")
+        IMM = autoclass("android.view.inputmethod.InputMethodManager")
+        done = {"ok": False, "err": None}
+
+        def _create():
+            try:
+                et = autoclass("android.widget.EditText")(activity)
+                # 关键: 普通文本。任何 password 变体都会让国产 ROM 切"安全键盘"
+                et.setInputType(int(InputType.TYPE_CLASS_TEXT)
+                                | int(InputType.TYPE_TEXT_VARIATION_NORMAL))
+                et.setSingleLine(True)
+                et.setImeOptions(int(EditorInfo.IME_ACTION_DONE)
+                                 | int(EditorInfo.IME_FLAG_NO_EXTRACT_UI))
+                et.setTextColor(int(Color.WHITE))
+                et.setBackgroundColor(int(Color.argb(170, 0, 0, 0)))
+                et.setHint("")
+                lp = FrameLayout.LayoutParams(
+                    int(FrameLayout.LayoutParams.MATCH_PARENT),
+                    int(FrameLayout.LayoutParams.WRAP_CONTENT))
+                lp.gravity = int(Gravity.BOTTOM)
+                activity.addContentView(et, lp)
+                et.requestFocus()
+                imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
+                imm.showSoftInput(et, int(IMM.SHOW_IMPLICIT))
+                _IME_STATE["et_view"] = et
+                _IME_STATE["imm"] = imm
+                _IME_STATE["last"] = ""
+                done["ok"] = True
+            except Exception as e:
+                done["err"] = repr(e)
+
+        activity.runOnUiThread(_VibeRunnable(_create))
+        import time as _t
+        for _ in range(24):          # 最多等 1.2s, 通常几十毫秒就回来了
+            if done["ok"] or done["err"]:
+                break
+            _t.sleep(0.05)
+        if not done["ok"]:
+            _IME_STATE["err"] = "EditText 兜底失败: %s" % done["err"]
+            _vib_log("[IME] %s" % _IME_STATE["err"])
+            return False
+        _vib_log("[IME] 已改用真实 EditText 唤起输入法")
+        return True
+    except Exception as e:
+        _IME_STATE["err"] = repr(e)
+        _vib_log("[IME] EditText 兜底异常: %r" % (e,))
+        return False
+
+
+def _ime_edittext_hide():
+    """撤掉兜底用的 EditText 并收起输入法。"""
+    et = _IME_STATE.pop("et_view", None)
+    imm = _IME_STATE.pop("imm", None)
+    if et is None:
+        return
+
+    def _rm():
+        try:
+            if imm is not None:
+                imm.hideSoftInputFromWindow(et.getWindowToken(), 0)
+            parent = et.getParent()
+            if parent is not None:
+                parent.removeView(et)
+        except Exception:
+            pass
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        PythonActivity.mActivity.runOnUiThread(_VibeRunnable(_rm))
+    except Exception:
+        pass
+
+
+def _ime_poll():
+    """每帧调用: 取回兜底 EditText 里新上屏的文本(没有则返回 '')。"""
+    et = _IME_STATE.get("et_view")
+    if et is None:
+        return ""
+    try:
+        cur = et.getText().toString()
+    except Exception:
+        return ""
+    prev = _IME_STATE.get("last", "")
+    if cur == prev:
+        return ""
+    n = 0
+    m = min(len(cur), len(prev))
+    while n < m and cur[n] == prev[n]:
+        n += 1
+    delta = cur[n:]
+    _IME_STATE["last"] = cur
+    return delta
+
+
 def _ime_hide():
-    """收起系统输入法(统一走 SDL 主路径)。"""
+    """收起系统输入法(SDL 主路径 + v1.24 EditText 兜底通道)。"""
     if not IS_ANDROID:
         return
     try:
@@ -664,6 +930,11 @@ def _ime_hide():
             sti()
     except Exception:
         pass
+    try:
+        _ime_edittext_hide()
+    except Exception:
+        pass
+    _IME_STATE["mode"] = "-"
 
 
 _VIB = {
@@ -2042,7 +2313,11 @@ class Game:
             corner_bias = 1.0
 
         # 2. 学习玩家射门历史 - 如果玩家重复选某个方向, 提高该方向权重
-        pattern_weights = [10, 4, 10, 8, 8, 8, 10, 20, 10]  # 基础权重
+        # v1.24: 8 号(中下)的权重从 20 降到 14, 并把中路/边路整体抬平。
+        # 原因: 改动 A 大幅削弱了"仅角相邻"的臂展覆盖后, 8 号不再是纳什最优蹲格
+        # (实测全 9x9 均衡里只占 6.3% vs 顶级门将 / 12.1% vs 均衡门将),
+        # AI 再死守 8 号就会出现"AI 蹲在被削弱的格子"的观感。
+        pattern_weights = [10, 6, 10, 10, 12, 10, 10, 14, 10]  # 基础权重
         if len(self.player_shot_history) >= 2:
             # 统计玩家最常选的方向(大方向: 左/中/右)
             recent = self.player_shot_history[-3:]  # 最近3次
@@ -2324,24 +2599,20 @@ class Game:
             # K_AC_BACK = 安卓返回键
             ac_back = getattr(pygame, "K_AC_BACK", None)
             if ev.key == pygame.K_ESCAPE or (ac_back and ev.key == ac_back):
+                # v1.24: 退出/返回【统一由 ESC(安卓返回键) 处理】。
+                # 旧版 R 键也会回退, 真机外接键盘/误触时经常"莫名其妙退回菜单",
+                # 故 R 键已彻底不再承担任何导航职责。
                 # v1.20: 正在编辑名字时按返回/ESC, 必须先退出编辑(顺带收起输入法)。
                 # 否则回到菜单后 _ptest_editing 还留着, 再进球员测试会发现
                 # "莫名其妙还在编辑态", 而且输入法可能没收回去。
                 if getattr(self, "_ptest_editing", None) is not None:
                     self._ptest_stop_edit()
+                    return
                 if self.state == State.MENU:
                     self.running = False
                 else:
                     self.state = State.MENU
                     self.state_t = 0.0
-                return
-            if ev.key == pygame.K_r:
-                # 重新开始 - GAME_OVER 时直接重选球员, 其他状态回菜单
-                if self.state == State.GAME_OVER:
-                    self.state = State.SELECT_STRIKER
-                else:
-                    self.state = State.MENU
-                self.state_t = 0.0
                 return
 
         if self.state == State.MENU:
@@ -2704,11 +2975,10 @@ class Game:
 
     def _handle_gameover(self, ev):
         if ev.type == pygame.KEYDOWN:
+            # v1.24: GAME_OVER 的 R 键"重新开始"也一并移除(避免误触),
+            # 返回统一用 ESC; 「再来一局」走按钮点击。
             if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self.state = State.MENU
-                self.state_t = 0.0
-            elif ev.key == pygame.K_r:
-                self.state = State.SELECT_STRIKER
                 self.state_t = 0.0
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             if self._point_in_rect(ev.pos, self._gameover_menu_rect()):
@@ -2954,6 +3224,20 @@ class Game:
                 prev = getattr(self, "_last_logged_state", None)
                 _log("STATE", "%s -> %s" % (prev, self.state))
                 self._last_logged_state = self.state
+        except Exception:
+            pass
+        # v1.24: 输入法兜底通道(真实 EditText)没有 SDL 的 TEXTINPUT 事件,
+        # 只能在每帧把编辑框里新上屏的文本取回来。
+        try:
+            if IS_ANDROID:
+                _d = _ime_poll()
+                if _d and getattr(self, "_ptest_editing", None) in ("s", "k"):
+                    _which = self._ptest_editing
+                    for _ch in _d:
+                        if _ch in ("\n", "\r"):
+                            self._ptest_finish_edit()
+                            break
+                        self._ptest_append_name(_which, _ch)
         except Exception:
             pass
         if self.cooldown > 0:
@@ -3330,12 +3614,25 @@ class Game:
             dist = math.hypot(kc_c[0] - cb_c[0], kc_c[1] - cb_c[1])
             dist_factor = max(0.55, 1.0 - dist * 0.10)
             effective_power = save_power * ball_quality * dist_factor
-            if level == "strong" and effective_power < 0.55:
-                base_prob *= 0.16
-                self._break_defense = True
-                attr_type = "break"
-            elif level == "strong":
-                base_prob *= 0.85
+            if level == "strong":
+                # v1.24 (C+F): 破防阈值挂钩反应, 且惩罚【连续化】——
+                # 旧版二值开关(<阈值 x0.16 / 否则 x0.85)让反应1~7 面对重炮完全无差别
+                # (实测扑救率全是 0.3~0.7%)。连续化后中低反应之间才有真实梯度。
+                #
+                # 【只作用于四角球】: 本作的属性分工就是"反应管四角远距离重力球、
+                # 扑救管非四角近距离重力球"(见上面 save_power 的选取), 反应在非四角
+                # 根本不参与判定。实测把连续化铺开到非四角后, 重炮打高反应门将从
+                # 90.5% 掉到 84.3%(门将反而变强), 与"加强重炮"相悖, 故严格限定四角。
+                if ball_is_corner:
+                    _bm = _break_mul(effective_power, _break_need(kp.reflex))
+                else:
+                    # 非四角: 完全保持 v1.23 的阈值与二值开关, 一动不动
+                    _bm = (BREAK_MUL_OLD_LO if effective_power < BREAK_NEED_BASE
+                           else BREAK_MUL_HI)
+                base_prob *= _bm
+                if _bm < BREAK_FLAG_AT:
+                    self._break_defense = True
+                    attr_type = "break"
             elif level == "weak":
                 base_prob *= 1.12
         elif is_adjacent:
@@ -3344,6 +3641,9 @@ class Game:
             # 快球: 无论臂展都基本扑不到(<5%)
             reach_n = _reach_cover(kp.reach)
             base_prob = (0.02 + slow_factor * 0.48) * reach_n
+            # v1.24 (A): 区分"仅角相邻"与"有边相邻"——
+            # 角相邻要横跨两格, 物理上几乎够不到, 极大幅度削弱(主要用来打掉"死守中间")
+            base_prob *= _adj_mul(ball_cell, keeper_cell)
             attr_type = "reach"
         else:
             attr_type = "none"
@@ -3386,12 +3686,21 @@ class Game:
         if self._shot_skill == "power_shot":
             base_prob *= 0.92
 
+        # v1.24 (D): 四角球 + 强球 —— 反应属性再放大一次(低反应更难挡四角)
+        if level == "strong" and ball_is_corner:
+            base_prob *= _corner_reflex_mul(kp.reflex)
+
         # 反应不及
+        # v1.24 (B+E): 强球改成"连续惩罚 + 按反应分档的残值":
+        #   迟到 tau 秒以上才吃满残值; 中/弱球【必须】保持二值, 否则低反应门将反而变强。
         if not reaction_ok:
             if level == "strong":
-                base_prob *= 0.08
+                _lat = _keeper_delay(kp.reflex) - self.ball_fly_t   # >0 = 迟到
+                _rf = max(0.0, min(1.0, 1.0 - _lat / REACT_TAU_STRONG))
+                _fl = _no_react_strong(kp.reflex)
+                base_prob *= (_fl + (1.0 - _fl) * _rf)
             else:
-                base_prob *= 0.25
+                base_prob *= NO_REACT_OTHER
 
         # 抛硬币判定
         if random.random() < base_prob:
@@ -3830,7 +4139,7 @@ class Game:
                 ("  重力球: 赌大方向(选对左/中/右)更划算", (210, 210, 210)),
                 ("", WHITE),
                 ("通用", GOLD),
-                ("  R 重新开始   ESC 返回菜单/退出   鼠标全程可用", WHITE),
+                ("  ESC = 返回/退出(唯一返回键)   鼠标全程可用", WHITE),
                 ("  5轮平局后进入加时赛(突然死亡)", WHITE),
                 ("  一方已无法追平时, 可选择继续或提前结算", WHITE),
             ]
