@@ -34,7 +34,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.21"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.22"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -201,6 +201,12 @@ POST_RADIUS = 0.06         # 门柱半径 m
 PHYS_DT = 1.0 / 240.0      # 物理积分子步长(固定步长保证可重复)
 # 出球速度 -> 到达门线速度 的典型衰减比(9m 飞行, 阻力吃掉约13%)
 SPEED_DECAY = 0.87
+
+# 慢速系数(臂展扑救)的球速映射边界(v1.22 放宽到覆盖全部真实球速)。
+#   真实到达门线球速约 12(最弱)~52(超大力满力) m/s。
+#   slow=1 当球速<=SLOW_LO(臂展对慢球效果最大); slow=0 当球速>=SLOW_HI(快球臂展几乎无效)。
+SLOW_LO = 12.0
+SLOW_HI = 52.0
 
 # 九宫格 - 射门/扑救目标区域
 #   1左上 2中上 3右上
@@ -509,8 +515,12 @@ def _ime_show():
     if not IS_ANDROID:
         return "desktop"
     got = []
-    # 1) SDL 文本输入(主路径): SDL 会用系统默认的普通键盘, 并投递 TEXTINPUT。
-    #    这是最干净的方式, 不会触发部分国产 ROM 的"隐私/安全键盘"。
+    # 主路径: 仅依赖 SDL 文本输入。SDL 会在自身的文本输入视图上唤起系统默认 IME,
+    # 不会触发部分国产 ROM(华为 EMUI 等)的"隐私/安全键盘"。
+    # 旧版曾用 JNI 在 DecorView 上 imm.showSoftInput(view, SHOW_IMPLICIT) 兜底, 但
+    # DecorView 并非可编辑视图, 在华为等 ROM 上被识别为不安全输入上下文, 从而强制
+    # 弹出"安全键盘/隐私键盘"(Android 官方亦提醒不要用 SHOW_FORCED, 且 showSoftInput
+    # 必须作用在 EditText/可聚焦可编辑视图上)。故 v1.22 起移除该兜底, 统一走 SDL 主路径。
     try:
         sti = getattr(pygame.key, "start_text_input", None)
         if sti:
@@ -518,33 +528,13 @@ def _ime_show():
             got.append("sdl_start_text_input")
     except Exception as e:
         _log_exc("IME", e)
-    # 2) JNI 兜底: 仅用 SHOW_IMPLICIT 唤起"用户默认的正常键盘"。
-    #    不再用 toggleSoftInput(SHOW_FORCED) —— 那会使部分 ROM 强制弹出
-    #    隐私/安全键盘; 也不再让视图进入"触摸可聚焦"模式(同样易触发安全输入)。
-    try:
-        from jnius import autoclass
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        activity = PythonActivity.mActivity
-        Context = autoclass("android.content.Context")
-        imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
-        view = activity.getWindow().getDecorView()
-        try:
-            view.requestFocus()
-        except Exception:
-            pass
-        try:
-            imm.showSoftInput(view, imm.SHOW_IMPLICIT)
-            got.append("imm_showSoftInput")
-        except Exception as e:
-            _log_exc("IME", e)
-    except Exception as e:
-        _log_exc("IME", e)
-    _log("IME", "唤起系统输入法 -> %s" % (", ".join(got) or "全部失败"))
+    if not got:
+        _log("IME", "SDL 文本输入未生效(个别 ROM 可能拉不起键盘, 需反馈补安全兜底)")
     return got
 
 
 def _ime_hide():
-    """收起系统输入法。"""
+    """收起系统输入法(统一走 SDL 主路径)。"""
     if not IS_ANDROID:
         return
     try:
@@ -553,17 +543,6 @@ def _ime_hide():
             sti()
     except Exception:
         pass
-    try:
-        from jnius import autoclass
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        activity = PythonActivity.mActivity
-        Context = autoclass("android.content.Context")
-        imm = activity.getSystemService(Context.INPUT_METHOD_SERVICE)
-        view = activity.getWindow().getDecorView()
-        imm.hideSoftInputFromWindow(view.getWindowToken(), 0)
-        _log("IME", "已收起系统输入法")
-    except Exception as e:
-        _log_exc("IME", e)
 
 
 _VIB = {
@@ -2064,7 +2043,8 @@ class Game:
         kp = self.keeper_profile
         if speed is None:
             speed = self._est_ball_speed()
-        slow = max(0.0, min(1.0, (26.0 - speed) / 8.0))
+        # 放宽到覆盖全部真实球速(12~52 m/s), 弱力档内也随球速平滑变化, 不再饱和成同一概率
+        slow = max(0.0, min(1.0, (SLOW_HI - speed) / (SLOW_HI - SLOW_LO)))
         reach_n = max(0.30, kp.reach / 10.0)
         p = (0.02 + slow * 0.48) * (reach_n ** 2.2)
         rf = 0.6 + 0.04 * kp.reach
@@ -2569,7 +2549,7 @@ class Game:
             if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 # 默认继续比赛
                 self._continue_after_early_end()
-            elif ev.key == pygame.K_e:
+            elif ev.key == pygame.K_ESCAPE:
                 # 直接结算
                 self._end_match_early()
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
@@ -3154,8 +3134,8 @@ class Game:
             level = "medium"
         else:
             level = "strong"
-        # 越慢 -> 系数越大(臂展覆盖相邻格的成功率越高)
-        slow_factor = max(0.0, min(1.0, (26.0 - ball_speed) / 8.0))
+        # 越慢 -> 系数越大(臂展覆盖相邻格的成功率越高); 与显示侧用同一 SLOW_LO/SLOW_HI 保持一致
+        slow_factor = max(0.0, min(1.0, (SLOW_HI - ball_speed) / (SLOW_HI - SLOW_LO)))
 
         # 射手疲劳影响球质
         striker_fat = self.player_fatigue if self.attacker_is_player else self.ai_fatigue
