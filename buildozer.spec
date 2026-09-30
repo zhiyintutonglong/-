@@ -9,10 +9,12 @@ source.dir = .
 # 需要打进 apk 的文件类型(字体必须是 ttf)
 source.include_exts = py,png,jpg,jpeg,ttf,otf,txt
 # 排除临时/测试文件
-source.exclude_patterns = _*.py,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt,debug.keystore
+# v1.24 追加 _*.txt 与 _snip*/ : 离线模拟/验收脚本的输出文件都以下划线开头,
+# 之前没排掉会被 aapt 一起塞进 APK 资产(实测 40+ 个共 270KB)。
+source.exclude_patterns = _*.py,_*.txt,__pycache__/*,*.pyc,.github/*,打包指南.md,VERSION.txt,debug.keystore
 
 # 版本(与 game.py 的 VERSION 常量保持一致)
-version = 1.23
+version = 1.24
 
 # 编译钩子: 让 APK 里的 .so 与游戏资源"原样存储"不压缩。
 # 用户要求"不要压缩, 空间无所谓, 甚至可以大一点" —— 不压缩后安装/启动更快,
