@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from statistics import NormalDist
 from typing import List, Optional, Tuple
 
 import pygame
@@ -34,7 +35,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.24"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.25"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -317,7 +318,11 @@ NO_REACT_STRONG = {1: 0.02, 2: 0.04, 3: 0.06, 4: 0.08, 5: 0.10,
                    6: 0.12, 7: 0.14, 8: 0.16, 9: 0.18, 10: 0.20}
 NO_REACT_OTHER = 0.25        # 中/弱球维持旧值(绝不能连续化, 否则低反应反而变强)
 # E. 强球反应惩罚连续化的时间常数(秒): 迟到 >= tau 才吃满残值惩罚。仅对强球生效。
-REACT_TAU_STRONG = 0.20
+# v1.25: 0.20 -> 0.22。实测(NS=800)平滑"反应7->8"的最大单级跳变:
+#   6.56 点 -> 4.24 点, 且反应1->7 梯度不降反升(10.24 -> 11.01 点),
+#   整体场景进球率不变(均衡0.8/顶级 79.1%->79.1%, 重炮/顶级 87.4%->87.6%),
+#   中等球走 NO_REACT_OTHER 分支与 tau 无关(实测 3σ 内一致)。
+REACT_TAU_STRONG = 0.22
 
 # D. 四角强球的额外反应缩放(反应1 -> 反应10)
 CORNER_REFLEX_LO = 0.60
@@ -347,6 +352,502 @@ BREAK_FLAG_AT = 0.35         # 乘数低于此值才判定为"破防"(影响文�
 # 力度系数下限(v1.23 提高): 旧值 0.3 会把"轻推"的偏差乘掉 70%, 于是
 # "准度1 轻轻一推也很准"。抬高到 0.55, 低准度在软射门下照样飘。
 POWER_FACTOR_MIN = 0.55
+
+
+# ====================================================================
+# v1.25 AI 强化 —— 五层递进(期望决策 / 对手建模 / 局势感知 / 属性自适应 / 公平护栏)
+# --------------------------------------------------------------------
+# 设计总纲(来自 2026-09-29 纳什分析的直接推论):
+#   均衡是底线(保下限不被剥削), 剥削是增量(按玩家历史最佳回应)。
+# 用户明确要求: 玩家的选择并非完全随机也非永远最优,
+#   因此保留相当比例的运气/随机成分(ε-随机 + 剥削封顶 + softmax 温度)。
+#
+# 实现方式: AI 不再"凭几何感觉"选格, 而是用真实概率模型算期望:
+#   1) _ai_save_prob: 纯函数复刻 _resolve_outcome 的扑救概率链(决策用, 非判定用,
+#      与显示侧 _adjacent_save_prob 同一思路, 必须与判定侧同步维护);
+#   2) _ai_goal_table: 蒙特卡洛 + 共用随机数(方差消减), 每场比赛为
+#      (射手, 门将, 疲劳档) 建一张 [力度档][瞄格][扑格]->进球率 表(约0.1~0.2s, 一次性);
+#   3) _OpponentModel: 指数衰减频率 + 力度条件 + 一阶马尔可夫,
+#      Dirichlet 先验 = 纳什均衡混合, 剥削权重有上限。
+# 任何一层抛异常都自动退回 v1.24 的启发式 AI(_ai_decide_shot_legacy / _ai_decide_dive_legacy),
+# 绝不允许 AI 代码把游戏搞挂。
+# ====================================================================
+
+# ---- 第1层: 期望决策 ----
+# 期望表的噪声采样数。【分层抽样(Latin Hypercube)】: 每个边际分布(高斯x/y、
+# 球速浮动、自旋)都按分层格均匀取遍, 边际统计精度等效数百个纯随机 draw。
+# 实测教训: 纯随机 12 个 draw 在角落高 miss 率(19%~55%)下估计方差高达
+# ±0.10+, 期望表 MAE 0.14~0.25 且格子间出现负相关; 分层后边界量化误差
+# 随 n 收敛: n=24 仍 ±0.05(同格/相邻概率跳变 0.48 的格子), n=48 压到
+# ±0.02(与 n=200 一致), PC 单表构建约 0.26s, 手机约 0.5~1s(按疲劳桶缓存)。
+AI_EV_SAMPLES = 48
+AI_TIERS_NORMAL = (0.5, 0.8, 1.0)   # 普通射门的三档力度
+AI_TIER_POWER = 1.3           # 超大力技能档(不受疲劳力度上限压制)
+AI_TIER_PRECISION = 0.6       # 超精准技能档(力度上限60%)
+AI_EV_FAT_BUCKET = 3.0        # 疲劳变化超过该值才重建期望表(控制卡顿)
+
+# ---- 第2层: 对手建模 ----
+AI_HIST_DECAY = 0.90          # 历史指数衰减(每轮 x0.90, 近期行为权重更高)
+AI_MARKOV_W = 0.35            # 马尔可夫预测权重(人类不擅长随机: win-stay/lose-shift 可利用)
+AI_PRIOR_ALPHA = 6.0          # Dirichlet 先验强度(等效6次"幽灵观测", 数据少时退回均衡)
+AI_WARM_ROUNDS = 60           # 从对局日志暖启动的最大轮数(跨场记忆玩家习惯)
+# 力度档先验(轻/中/满/超大力): 玩家默认偏好中档, 偶尔拉满
+AI_TIER_PRIOR = (0.30, 0.40, 0.25, 0.05)
+
+# ---- 第5层: 公平护栏(用户要求保留运气成分) ----
+# 剥削混合比上限(预测分布 = cap*观测 + (1-cap)*先验)。v1.25 实测调参:
+# 0.45 时对"角落偏好"人类的失球率反而比 legacy 高 4.6 个点 —— 四角对称
+# 证据下任何单一扑格只覆盖 1/4 角球质量, 先验打底过多会让"守中排"与
+# "扑角"期望打平, 门将蹲格熵 0.99(近乎均匀)。0.65 时对三类人类 bot
+# 全部优于 legacy 且保留 35% 先验 + ε随机 + softmax 采样三层随机性。
+AI_EXPLOIT_MAX = 0.65
+AI_EPS_RANDOM = 0.12          # epsilon-随机: 12% 完全随机决策
+
+# 纳什先验: 均衡0.8射手 vs 均衡门将(5/5/5), tau=0.22, 期望表分层抽样
+# 修复后 N=200/格对实测的双方极小极大混合, 再与均匀分布 7:3 混合
+# (纯均衡含0%格子, 对人类对手不合理 —— 人会打1/3号, 先验为0会导致
+# Dirichlet 平滑后仍几乎不预测该格)。注意均衡以中排(4/5/6)为主。
+AI_PRIOR_SHOT = {1: 0.033, 2: 0.033, 3: 0.033, 4: 0.277, 5: 0.193,
+                 6: 0.193, 7: 0.059, 8: 0.084, 9: 0.094}
+AI_PRIOR_DIVE = {1: 0.033, 2: 0.033, 3: 0.033, 4: 0.172, 5: 0.172,
+                 6: 0.101, 7: 0.139, 8: 0.161, 9: 0.155}
+
+
+def _cell_of(x: float, y: float) -> int:
+    """球门内坐标 -> 最近格子编号(1-9)。_pos_to_cell 的模块级纯函数版,
+    供 AI 期望表/日志把 (tx,ty) 归到格子(两处逻辑必须一致)。"""
+    best_cell, best_dist = 5, 1e9
+    for cell, (cx, cy) in CELL_CENTERS.items():
+        d = (x - cx) ** 2 + (y - cy) ** 2
+        if d < best_dist:
+            best_dist, best_cell = d, cell
+    return best_cell
+
+
+def _ai_bucket(power: float, skill: str = "normal") -> int:
+    """实际力度 -> 4 个 canonical 档位(模型预测空间)。
+    B0轻<=0.62 / B1中<=0.92 / B2满 / B3超大力技能。"""
+    if skill == "power_shot":
+        return 3
+    p = max(0.0, min(1.3, float(power or 0.5)))
+    if p <= 0.62:
+        return 0
+    if p <= 0.92:
+        return 1
+    return 2
+
+
+def _ai_tiers_for(sp):
+    """一个射手的期望表力度档列表: [(power, skill_mode), ...]。
+    普通三档 + 技能档(power_shot->1.3 / precision->0.6)。"""
+    tiers = [(0.5, "normal"), (0.8, "normal"), (1.0, "normal")]
+    if getattr(sp, "skill", "none") == "power_shot":
+        tiers.append((AI_TIER_POWER, "power_shot"))
+    if getattr(sp, "skill", "none") == "precision":
+        tiers.append((AI_TIER_PRECISION, "precision"))
+    return tiers
+
+
+def _ai_save_prob(bx, by, ball_speed, fly_t, dive_cell,
+                  sp_power, sp_acc, kp, striker_fat, skill="normal"):
+    """纯函数复刻 _resolve_outcome 的扑救概率链(v1.25 AI 决策用)。
+
+    与判定侧的差异: 只算概率不掷硬币、不产生副作用(动画/文案/标记)。
+    【维护纪律】: _resolve_outcome 里的概率链任何改动, 这里必须同步,
+    否则 AI 会按过时的世界观决策(和显示侧 _adjacent_save_prob 同样的约定)。
+    """
+    in_goal = (-GOAL_W / 2 <= bx <= GOAL_W / 2) and (0 <= by <= GOAL_H)
+    if not in_goal:
+        return 0.0
+    ball_cell = _cell_of(bx, by)
+    keeper_cell = dive_cell
+    dir_correct = (ball_cell == keeper_cell)
+    is_adjacent = (not dir_correct and
+                   keeper_cell in CELL_ADJACENT.get(ball_cell, []))
+    ball_is_corner = ball_cell in CORNER_CELLS
+
+    if dir_correct:
+        base_prob = 0.68
+    elif is_adjacent:
+        base_prob = 0.15
+    else:
+        base_prob = 0.02
+    if by >= 1.55:
+        base_prob *= 0.78
+    elif by <= 0.75:
+        base_prob *= 1.22
+
+    if ball_speed < 19.0:
+        level = "weak"
+    elif ball_speed < 23.5:
+        level = "medium"
+    else:
+        level = "strong"
+    slow_factor = max(0.0, min(1.0, (SLOW_HI - ball_speed) / (SLOW_HI - SLOW_LO)))
+    ball_quality = 1.0 - striker_fat * 0.03
+
+    if dir_correct:
+        save_power = (_reflex_power(kp.reflex) if ball_is_corner
+                      else _dive_power(kp.dive))
+        kc_c = CELL_CENTERS[keeper_cell]
+        cb_c = CELL_CENTERS[8]
+        dist = math.hypot(kc_c[0] - cb_c[0], kc_c[1] - cb_c[1])
+        dist_factor = max(0.55, 1.0 - dist * 0.10)
+        effective_power = save_power * ball_quality * dist_factor
+        if level == "strong":
+            if ball_is_corner:
+                _bm = _break_mul(effective_power, _break_need(kp.reflex))
+            else:
+                _bm = (BREAK_MUL_OLD_LO if effective_power < BREAK_NEED_BASE
+                       else BREAK_MUL_HI)
+            base_prob *= _bm
+        elif level == "weak":
+            base_prob *= 1.12
+    elif is_adjacent:
+        reach_n = _reach_cover(kp.reach)
+        base_prob = (0.02 + slow_factor * 0.48) * reach_n
+        base_prob *= _adj_mul(ball_cell, keeper_cell)
+
+    if level == "strong":
+        speed_factor = 0.88
+    elif level == "medium":
+        speed_factor = 0.95
+    else:
+        speed_factor = 1.0
+    if is_adjacent:
+        speed_factor = 1.0
+    base_prob *= speed_factor
+
+    reflex_factor = _attr_factor(kp.reflex)
+    reach_factor = _attr_factor(kp.reach)
+    dive_factor = _attr_factor(kp.dive)
+    if is_adjacent:
+        attr_factor = (reflex_factor * 0.15 + reach_factor * 0.70 + dive_factor * 0.15)
+    elif level == "strong" and ball_is_corner:
+        attr_factor = (reflex_factor * 0.65 + reach_factor * 0.10 + dive_factor * 0.25)
+    elif level == "strong":
+        attr_factor = (reflex_factor * 0.20 + reach_factor * 0.10 + dive_factor * 0.70)
+    else:
+        attr_factor = (reflex_factor + reach_factor + dive_factor) / 3.0
+    base_prob *= attr_factor
+
+    base_prob *= _pow_pressure(sp_power) * _acc_place(sp_acc)
+    if skill == "power_shot":
+        base_prob *= 0.92
+    if level == "strong" and ball_is_corner:
+        base_prob *= _corner_reflex_mul(kp.reflex)
+
+    # 反应不及(判定侧: keeper.dive_t>0, 等价于 飞行时间 > 反应延迟)
+    if fly_t <= _keeper_delay(kp.reflex):
+        if level == "strong":
+            _lat = _keeper_delay(kp.reflex) - fly_t
+            _rf = max(0.0, min(1.0, 1.0 - _lat / REACT_TAU_STRONG))
+            _fl = _no_react_strong(kp.reflex)
+            base_prob *= (_fl + (1.0 - _fl) * _rf)
+        else:
+            base_prob *= NO_REACT_OTHER
+    return max(0.0, min(0.97, base_prob))
+
+
+def _ai_noise_model(sp, power, fatigue, skill, is_overtime, who):
+    """复刻射门噪声/球速模型 -> (sigma_x, sigma_y, speed_base)。
+    who="player" 用玩家侧噪声约定(power_shot x0.85), "ai" 用 AI 侧(x1.05)。"""
+    acc = sp.accuracy
+    if skill == "precision":
+        amp = _acc_noise(acc) * 0.30
+    elif skill == "power_shot":
+        amp = _acc_noise(acc) * (0.85 if who == "player" else 1.05)
+    else:
+        amp = _acc_noise(acc)
+    if is_overtime:
+        amp *= (1.0 - _compose_clutch(sp.composure))
+    amp += fatigue * 0.14
+    pf = POWER_FACTOR_MIN + (1.0 - POWER_FACTOR_MIN) * min(1.0, power)
+    if power > 0.7:
+        amp *= (1.0 + ((power - 0.7) / 0.3) * _acc_bigpower(acc))
+    sx, sy = 1.5 * amp * pf, 1.2 * amp * pf
+    base = _spd_base(sp.power) + _spd_slope(sp.power) * min(1.0, power)
+    base *= (1.0 - fatigue * 0.04)
+    if skill == "power_shot":
+        base *= POWER_SHOT_BOOST
+    return sx, sy, max(6.0, base)
+
+
+def _ai_strat_draws(rng, n):
+    """分层抽样(Latin Hypercube)生成期望表的噪声 draw 集。
+
+    把 [0,1) 均分成 n 层, 高斯x/高斯y/球速浮动/自旋四个边际各自独立
+    洗牌取层 -> 每个边际分布都被"均匀代表"(miss 率、球速分布都是近乎
+    确定的), 只保留层间配对的少量方差。这是小样本下让期望表既准又稳
+    的关键: 纯随机 draw 在角落 miss 率 50% 时 12 个样本的整体偏差
+    可达 ±0.10 以上(实测 MAE 0.14/0.25, 格子间甚至负相关)。
+    """
+    strat = [(i + 0.5) / n for i in range(n)]
+
+    def _shuf(xs):
+        xs = xs[:]
+        for i in range(len(xs) - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            xs[i], xs[j] = xs[j], xs[i]
+        return xs
+
+    nd = NormalDist()
+    zx = [nd.inv_cdf(u) for u in _shuf(strat)]
+    zy = [nd.inv_cdf(u) for u in _shuf(strat)]
+    sm = [0.92 + 0.16 * u for u in _shuf(strat)]
+    sp = [-9.0 + 18.0 * u for u in _shuf(strat)]
+    return list(zip(zx, zy, sm, sp))
+
+
+def _ai_goal_table(sp, kp, fatigue, is_overtime, tiers, who,
+                   samples=AI_EV_SAMPLES, seed=20260930):
+    """为 (射手, 门将, 疲劳, 力度档集) 建期望进球率表。
+
+    返回 [tier] -> {aim} -> {dive} -> P(进球)。
+    关键技巧 —— 共用随机数: 同一力度档内 9 个瞄格共享同一组
+    (高斯draw, 球速浮动) 采样, 差分方差极小, 排序稳定。
+    draw 集用 _ai_strat_draws 分层抽样(见其 docstring, 小样本必须分层,
+    否则角落格的 miss 率估计噪声直接污染整张表)。
+    物理用真实 solve_launch(实测 0.22ms/次), 全表 4 档x9格x48样本 ~= 0.3s。
+    使用独立 rng(固定种子), 不污染全局随机流(否则离线探针结果不可比)。
+    """
+    rng = random.Random(seed + int(fatigue * 10) + sp.power * 131 + kp.reflex * 17)
+    out = []
+    for power, skill in tiers:
+        sx, sy, spd_base = _ai_noise_model(sp, power, fatigue, skill,
+                                           is_overtime, who)
+        # 普通射门带 ±9 rad/s 随机侧旋(与 _commit_player_shot/_ai_execute_shot
+        # 一致), 传给 solve_launch 保持物理一致(自旋对 t_fly/v_arr 影响很小,
+        # 但保持管线一致总没错)。
+        draws = _ai_strat_draws(rng, samples)
+        tier_tab = {}
+        for aim in CELL_CENTERS:
+            tx0, ty0 = CELL_CENTERS[aim]
+            acc_goal = {j: 0.0 for j in CELL_CENTERS}
+            for zx, zy, sm, spin in draws:
+                bx = tx0 + zx * sx
+                by = max(0.05, ty0 + zy * sy)
+                if not (-GOAL_W / 2 <= bx <= GOAL_W / 2 and 0 <= by <= GOAL_H):
+                    continue                      # 射偏: 全部扑格下都是 0 进球
+                speed = max(6.0, spd_base * sm)
+                _vx, _vy, _vz, t_fly, v_arr = solve_launch(
+                    0.0, BALL_RADIUS, PENALTY_Z, bx, by, speed, spin)
+                for j in CELL_CENTERS:
+                    p = _ai_save_prob(bx, by, v_arr, t_fly, j,
+                                      sp.power, sp.accuracy, kp,
+                                      fatigue, skill)
+                    acc_goal[j] += 1.0 - p
+            n = float(samples)
+            tier_tab[aim] = {j: v / n for j, v in acc_goal.items()}
+        out.append(tier_tab)
+    return out
+
+
+def _ai_softmax_pick(items, scores, beta, rng=None):
+    """按 softmax(beta*score) 采样一个 item(保留不可预测性, 不取 argmax)。"""
+    mx = max(scores)
+    ws = [math.exp(beta * (s - mx)) for s in scores]
+    tot = sum(ws)
+    r = (rng or random).random() * tot
+    acc = 0.0
+    for it, w in zip(items, ws):
+        acc += w
+        if r <= acc:
+            return it
+    return items[-1]
+
+
+class _OpponentModel:
+    """对手建模(第2层): 指数衰减频率 + 力度条件 + 一阶马尔可夫,
+    Dirichlet 先验=纳什均衡, 剥削权重封顶(第5层公平护栏)。
+
+    两份实例: _ai_shot_model(玩家射门分布, 供 AI 门将) /
+              _ai_dive_model(玩家扑救分布, 供 AI 射手)。
+    数据源: 局内实时观测 + 跨场日志暖启动(_ai_warm_models)。
+    """
+
+    def __init__(self, prior):
+        self.prior = dict(prior)
+        self.cap = AI_EXPLOIT_MAX        # 剥削混合比上限(由 AI 强度参数调节)
+        self.w = {c: 0.0 for c in CELL_CENTERS}      # 衰减频率计数
+        self.tot = 0.0
+        self.prev = None
+        self.trans = {}                              # prev -> {cell: count}
+        self.tier_w = [0.0, 0.0, 0.0, 0.0]           # 力度档衰减计数(B0..B3)
+        self.tier_cond = [{c: 0.0 for c in CELL_CENTERS} for _ in range(4)]
+
+    def observe(self, cell, tier=None):
+        try:
+            dk = AI_HIST_DECAY
+            for c in CELL_CENTERS:
+                self.w[c] *= dk
+            self.w[cell] += 1.0
+            self.tot = self.tot * dk + 1.0
+            for t in range(4):
+                self.tier_w[t] *= dk
+                for c in CELL_CENTERS:
+                    self.tier_cond[t][c] *= dk
+            if tier is not None:
+                self.tier_w[tier] += 1.0
+                self.tier_cond[tier][cell] += 1.0
+            if self.prev is not None:
+                d = self.trans.setdefault(self.prev, {})
+                d[cell] = d.get(cell, 0.0) + 1.0
+            self.prev = cell
+        except Exception:
+            pass
+
+    def aim_dist(self):
+        """P̂(格): (频率 Dirichlet 平滑) 与 (一阶马尔可夫) 混合,
+        再与纳什先验按剥削封顶混合。数据为0时 = 纯先验(均衡, 不可剥削)。"""
+        alpha = AI_PRIOR_ALPHA
+        freq = {c: (self.w[c] + alpha * self.prior[c]) / (self.tot + alpha)
+                for c in CELL_CENTERS}
+        mk = None
+        if self.prev is not None and self.prev in self.trans:
+            d = self.trans[self.prev]
+            s = sum(d.values())
+            if s >= 2.0:
+                mk = {c: d.get(c, 0.0) / s for c in CELL_CENTERS}
+        if mk is not None:
+            blend = {c: (1.0 - AI_MARKOV_W) * freq[c] + AI_MARKOV_W * mk[c]
+                     for c in CELL_CENTERS}
+        else:
+            blend = freq
+        w_obs = min(getattr(self, "cap", AI_EXPLOIT_MAX),
+                    self.tot / (self.tot + alpha))
+        out = {c: (1.0 - w_obs) * self.prior[c] + w_obs * blend[c]
+               for c in CELL_CENTERS}
+        s = sum(out.values())
+        return {c: out[c] / s for c in CELL_CENTERS}
+
+    def tier_dist(self):
+        """P(力度档 B0..B3): 无观测时用先验。"""
+        tot = sum(self.tier_w)
+        pr = AI_TIER_PRIOR
+        if tot < 1e-6:
+            return list(pr)
+        out = [(self.tier_w[t] + AI_PRIOR_ALPHA * pr[t]) / (tot + AI_PRIOR_ALPHA)
+               for t in range(4)]
+        s = sum(out)
+        return [v / s for v in out]
+
+    def aim_given_tier(self, t):
+        """P(格|力度档): 条件计数不足(<2)时回退到 aim_dist。
+        玩家力度与落点强相关(重炮偏爱角), 这一项是真实可利用的模式。"""
+        tot = sum(self.tier_cond[t].values())
+        if tot < 2.0:
+            return self.aim_dist()
+        ad = self.aim_dist()
+        out = {c: (self.tier_cond[t][c] + 2.0 * ad[c]) / (tot + 2.0)
+               for c in CELL_CENTERS}
+        s = sum(out.values())
+        return {c: out[c] / s for c in CELL_CENTERS}
+
+
+# --------------------------------------------------------------------
+# v1.25 对局日志(matches.jsonl): 每轮一条 JSON 记录 + 每场一条汇总。
+# 用途: ①玩家上传给我们做平衡/AI 迭代分析; ②AI 跨场暖启动(本地习惯分析)。
+# 路径与 dev_params.json 同目录(安卓=外部文件目录可自取, PC=local_data/)。
+# --------------------------------------------------------------------
+def _matchlog_path():
+    try:
+        if IS_ANDROID:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            d = PythonActivity.mActivity.getExternalFilesDir(None).getAbsolutePath()
+        else:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "local_data")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+        return os.path.join(d, "matches.jsonl")
+    except Exception:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "matches.jsonl")
+
+
+_MATCHLOG_MAX_BYTES = 2 * 1024 * 1024     # 超过 2MB 保留最近 5000 行
+
+
+def _matchlog_append(rec):
+    """追加一条记录; 体积超限先滚动截断。任何异常都不影响游戏。"""
+    try:
+        import json as _json
+        p = _matchlog_path()
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > _MATCHLOG_MAX_BYTES:
+                with open(p, "r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.writelines(lines[-5000:])
+        except Exception:
+            pass
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _matchlog_recent_rounds(n=AI_WARM_ROUNDS):
+    """读最近 n 条 round 记录(oldest->newest), 供暖启动与习惯分析。"""
+    try:
+        import json as _json
+        p = _matchlog_path()
+        if not os.path.exists(p):
+            return []
+        with open(p, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+        out = []
+        for ln in lines[-(n * 2):]:          # round/match 混存, 多读一倍再过滤
+            try:
+                r = _json.loads(ln)
+                if r.get("t") == "round":
+                    out.append(r)
+            except Exception:
+                pass
+        return out[-n:]
+    except Exception:
+        return []
+
+
+def _matchlog_habit(n=300):
+    """本地玩家习惯分析(供开发者模块展示; AI 暖启动用的是同一个数据源)。
+    返回 dict: 射门/扑救的格子频率、交替率、力度档分布、重炮/弧线使用率。"""
+    recs = _matchlog_recent_rounds(n)
+    shots = [r for r in recs if r.get("atk") == "P" and r.get("aim")]
+    dives = [r for r in recs if r.get("atk") == "A" and r.get("dive")]
+    res = {"rounds": len(recs), "shots": len(shots), "dives": len(dives)}
+
+    def _freq(keys):
+        f = {}
+        for k in keys:
+            f[k] = f.get(k, 0) + 1
+        return f
+
+    sf = _freq([int(r["aim"]) for r in shots])
+    res["shot_top"] = sorted(sf.items(), key=lambda kv: -kv[1])[:4]
+    df = _freq([int(r["dive"]) for r in dives])
+    res["dive_top"] = sorted(df.items(), key=lambda kv: -kv[1])[:4]
+    # 交替率: 与上一格不同(左右切换或换行)的比例 —— 高=可被马尔可夫利用
+    alt = tot = 0
+    prev = None
+    for r in shots:
+        c = int(r["aim"])
+        if prev is not None:
+            tot += 1
+            if c != prev:
+                alt += 1
+        prev = c
+    res["shot_alt"] = (alt / tot) if tot >= 3 else None
+    tb = _freq([_ai_bucket(r.get("pw", 0.8), r.get("skill", "normal"))
+                for r in shots])
+    res["tier"] = tb
+    res["curve"] = sum(1 for r in shots if r.get("skill") == "curve")
+    return res
+
 
 
 def _clamp_attr(v):
@@ -630,6 +1131,7 @@ PARAM_DEFS = [
     ("dedup_dist_px",   "触摸·去重距离",   100,   0,   400,   10,   "px"),
     ("power_speed",     "玩法·重炮判定球速", 25,  5,    60,    1,   "m/s"),
     ("shake_amp",       "画面·震屏幅度",   11,    0,    40,    1,   "px"),
+    ("ai_strength",     "AI·强度",          70,    0,    100,   5,   "%"),
 ]
 # 默认值快照(重置时用)
 PARAM_DEFAULT = {k: v for k, _n, v, _lo, _hi, _s, _u in PARAM_DEFS}
@@ -2120,8 +2622,23 @@ class Game:
         self.precision_shot_used = False
         self.ai_precision_used = False
         # AI 整场固定一名射手 + 一名门将, 与玩家对等(不再每个球换人)
-        self.ai_striker_profile = random.choice(STRIKERS)
-        self.ai_keeper_profile = random.choice(KEEPERS)
+        # v1.25: 选人走 _ai_pick_profile —— 默认【排除】玩家自制角色;
+        # 开发者模块"AI选用自制角色"开关开启时, 按强度正相关概率选用
+        # (三维全满=30 -> 0.8, 三维之和<=20 -> 0, 线性插值)。
+        self.ai_striker_profile = self._ai_pick_profile(STRIKERS)
+        self.ai_keeper_profile = self._ai_pick_profile(KEEPERS)
+        # v1.25: 对手建模(第2层) + 跨场日志暖启动(本地分析玩家习惯)
+        self._ai_shot_model = _OpponentModel(AI_PRIOR_SHOT)
+        self._ai_dive_model = _OpponentModel(AI_PRIOR_DIVE)
+        self._ai_warm_models()
+        # v1.25: 对局日志开关 —— 只有真实对局才写 matches.jsonl
+        # (离线探针/自动化测试直接驱动 _commit_player_shot, 不能刷日志)
+        self._matchlog_on = True
+        # v1.25: 期望表缓存(第1层), 按需懒构建, 疲劳档变化时失效
+        self._ai_tbl_a = None      # [玩家射手 x AI门将] 供 AI 扑救决策
+        self._ai_tbl_b = None      # [AI射手 x 玩家门将] 供 AI 射门决策
+        self._ai_tbl_a_key = None
+        self._ai_tbl_b_key = None
         self.power_shot_active = False
         self.selected_skill = "normal"
         self.ai_selected_skill = "normal"
@@ -2195,8 +2712,228 @@ class Game:
         self.intro_t = 0.0
         self.state_t = 0.0
 
+    # ================================================================
+    # v1.25 AI 决策层 —— 五层递进:
+    #   ①期望决策(真实概率模型) ②对手建模(频率/条件/马尔可夫+均衡先验)
+    #   ③局势感知(方差偏好)     ④属性自适应(隐含在期望表)+疲劳预算
+    #   ⑤公平护栏(只用公开历史/剥削封顶/epsilon-随机, 保留运气成分)。
+    # 任何一层抛异常都退回 _legacy 启发式(v1.24 原实现, 原样保留)。
+    # ================================================================
+    def _ai_pick_custom_prob(self, prof):
+        """开发者模块"AI选用自制角色"的强度正相关概率:
+        三维全满(和=30) -> 0.8; 三维之和<=20 -> 0; 中间线性插值。"""
+        if prof is None:
+            return 0.0
+        try:
+            if isinstance(prof, StrikerProfile):
+                s = int(prof.power) + int(prof.accuracy) + int(prof.composure)
+            else:
+                s = int(prof.reflex) + int(prof.reach) + int(prof.dive)
+        except Exception:
+            return 0.0
+        return max(0.0, min(0.8, (s - 20) * 0.08))
+
+    def _ptest_ai_pick_enabled(self):
+        return bool(getattr(self, "_tester_ai_pick", False))
+
+    def _ai_pick_profile(self, roster):
+        """AI 选人: 默认【排除】玩家自制角色(与 v1.24 行为不同 —— 那时
+        自制卡进了选卡列表就会被 AI 均匀抽到)。开关开启后按强度概率选用。"""
+        try:
+            custom = [p for p in roster if getattr(p, "key", "") == "custom"]
+            normal = [p for p in roster if getattr(p, "key", "") != "custom"]
+            if custom and self._ptest_ai_pick_enabled():
+                if random.random() < self._ai_pick_custom_prob(custom[0]):
+                    return custom[0]
+            if normal:
+                return random.choice(normal)
+            return random.choice(roster)
+        except Exception:
+            try:
+                return random.choice(roster)
+            except Exception:
+                return None
+
+    def _ai_warm_models(self):
+        """跨场暖启动: 从对局日志读最近若干轮, 预填对手模型。
+        这就是"本地分析玩家习惯"的数据通路 —— AI 会带着对上几场你的记忆开局。"""
+        try:
+            recs = _matchlog_recent_rounds(AI_WARM_ROUNDS)
+            for r in recs:
+                try:
+                    if r.get("atk") == "P" and r.get("aim"):
+                        b = _ai_bucket(r.get("pw", 0.8), r.get("skill", "normal"))
+                        self._ai_shot_model.observe(int(r["aim"]), b)
+                    elif r.get("atk") == "A" and r.get("dive"):
+                        self._ai_dive_model.observe(int(r["dive"]))
+                except Exception:
+                    pass
+            if recs:
+                _log("AI", "暖启动: 读入 %d 轮历史" % len(recs))
+        except Exception as e:
+            _log_exc("AI-WARM", e)
+
+    def _ai_strength01(self):
+        try:
+            return max(0.0, min(1.0, float(_param("ai_strength")) / 100.0))
+        except Exception:
+            return 0.7
+
+    def _ai_beta(self, base):
+        """softmax 陡度随强度缩放(强=更贪婪, 弱=更平)。"""
+        return base * (0.5 + self._ai_strength01())
+
+    def _ai_eps(self):
+        """epsilon-随机: 强度越低随机越多(默认70%强度时约 0.11)。"""
+        return AI_EPS_RANDOM * (1.6 - self._ai_strength01())
+
+    def _ai_exploit_cap(self):
+        """剥削混合比上限(第5层护栏): 至少 35% 先验打底(由强度参数缩放)。"""
+        s = self._ai_strength01()
+        return max(0.10, min(AI_EXPLOIT_MAX, AI_EXPLOIT_MAX * (0.4 + 0.85 * s)))
+
+    def _ai_behind_urgency(self):
+        """AI 落后的紧迫度(0~1): 突然死亡=1, 常规=落后球数/剩余可追轮次。"""
+        sd = self.ai_score - self.player_score
+        if sd >= 0:
+            return 0.0
+        if self.is_overtime:
+            return 1.0
+        rem = max(1, self.total_rounds - self.round_num + 1)
+        return min(1.0, (-sd) / max(1.0, rem * 0.6))
+
+    def _ai_variance_pref(self):
+        """第3层 方差偏好 kappa: 落后求变(正=青睐高方差的重炮死角),
+        领先求稳(负=青睐低方差的轻推中排)。utility = p + kappa*p*(1-p)。"""
+        sd = self.ai_score - self.player_score
+        if sd < 0:
+            return 0.35 * self._ai_behind_urgency()
+        if sd > 0:
+            return -0.20 * min(1.0, sd / 3.0)
+        return 0.0
+
+    def _ai_tbl(self, which):
+        """期望表懒构建 + 缓存(which="a" 玩家射手xAI门将 / "b" AI射手x玩家门将)。
+        缓存键含疲劳档: 疲劳变化超过 AI_EV_FAT_BUCKET 才重建(控制手机端卡顿)。"""
+        try:
+            if which == "a":
+                sp = self.striker_profile
+                kp = self.ai_keeper_profile or random.choice(KEEPERS)
+                fat = self.player_fatigue
+                who = "player"
+            else:
+                sp = self.ai_striker_profile or random.choice(STRIKERS)
+                kp = self.keeper_profile
+                fat = self.ai_fatigue
+                who = "ai"
+            key = (sp.key, sp.power, sp.accuracy, sp.composure,
+                   kp.key, kp.reflex, kp.reach, kp.dive,
+                   int(fat // AI_EV_FAT_BUCKET), bool(self.is_overtime))
+            kattr = "_ai_tbl_%s_key" % which
+            if getattr(self, kattr, None) == key:
+                return getattr(self, "_ai_tbl_" + which)
+            tbl = _ai_goal_table(sp, kp, fat, self.is_overtime,
+                                 _ai_tiers_for(sp), who)
+            setattr(self, "_ai_tbl_" + which, tbl)
+            setattr(self, kattr, key)
+            return tbl
+        except Exception as e:
+            _log_exc("AI-TBL", e)
+            setattr(self, "_ai_tbl_" + which, None)
+            setattr(self, "_ai_tbl_%s_key" % which, None)
+            return None
+
     def _ai_decide_shot(self):
-        """AI 决定射门目标 + 力度 - 智能策略系统."""
+        """AI 决定射门目标 + 力度 - v1.25 期望决策(异常退回 legacy)。"""
+        try:
+            ai_sp = self.ai_striker_profile
+            if ai_sp is None:
+                ai_sp = random.choice(STRIKERS)
+                self.ai_striker_profile = ai_sp
+            tbl = self._ai_tbl("b")
+            if tbl is not None:
+                cells = list(CELL_CENTERS.keys())
+                tiers = _ai_tiers_for(ai_sp)
+                cap = 1.0 - self.ai_fatigue * 0.12   # _ai_execute_shot 的疲劳力度上限
+                clutch = 0.20 if self.is_overtime else 0.0
+                # 可行选项(第4层: 疲劳预算 + 技能充能门控)
+                opts = []
+                for idx, (power, skill) in enumerate(tiers):
+                    if idx >= len(tbl):
+                        break
+                    if skill == "normal" and power >= 1.0 and cap < 0.95:
+                        continue          # 疲劳高, 满力档被压制 -> 只用 0.8 档
+                    if (skill == "power_shot" and not
+                            (self.ai_skill_charge >= 60 and self.ai_fatigue < 5.0)):
+                        continue
+                    if (skill == "precision" and (self.ai_precision_used
+                                                  or self.ai_skill_charge < 80)):
+                        continue
+                    opts.append((idx, power, skill))
+                if not opts:
+                    opts = [(min(1, len(tbl) - 1), 0.8, "normal")]
+                # 对手建模(第2层): 预测玩家扑格分布
+                model = self._ai_dive_model
+                model.cap = self._ai_exploit_cap()
+                dd = model.aim_dist()
+                # 期望 + 局势效用(第3层) + 疲劳罚(第4层)
+                kappa = self._ai_variance_pref()
+                items, scores = [], []
+                for idx, power, skill in opts:
+                    tt = tbl[idx]
+                    for i in cells:
+                        g = tt[i]
+                        e = 0.0
+                        for j in cells:
+                            e += dd[j] * g[j]
+                        u = e + kappa * e * (1.0 - e)
+                        if skill == "power_shot":
+                            u -= 0.02 + self.ai_fatigue * 0.004
+                        elif power >= 1.0:
+                            u -= self.ai_fatigue * 0.002
+                        items.append((i, power, skill))
+                        scores.append(u)
+                # 第5层: epsilon-随机 + softmax 采样(不取 argmax, 保留不可预测性)
+                if random.random() < self._ai_eps():
+                    # v1.25: eps 分支不再 27 选项均匀乱选(实测对纳什bot
+                    # 白丢 ~3 个点), 改用低β softmax —— 依旧随机, 但不蠢。
+                    aim, power, skill = _ai_softmax_pick(items, scores,
+                                                         self._ai_beta(3.0))
+                else:
+                    # v1.25: β 7->22。27 选项效用差小, β=8.4 时力度档混得太平
+                    # (0.5 档仅 42%, 而表地形显示对扑错门将低力档严格占优),
+                    # 与 legacy 的低力+边角近似最优打法差距 -0.06~-0.09。
+                    aim, power, skill = _ai_softmax_pick(items, scores,
+                                                         self._ai_beta(22.0))
+                self.ai_selected_skill = skill
+                # 弧线球射手: 期望表不建模弧线(球速x0.88+双格落点),
+                # 保留原有的使用倾向作为风味层, 瞄格仍由期望决策给出。
+                self.ai_curve_cell2 = 0
+                if ai_sp.skill == "curve" and skill == "normal":
+                    p = 0.72 if abs(self.ai_score - self.player_score) >= 1 else 0.58
+                    if random.random() < min(0.90, p + clutch):
+                        # 关键: 必须把技能标成 "curve", _ai_execute_shot 才会
+                        # 走弧线物理(球速x0.88 + 侧旋), 否则只是个普通射门
+                        self.ai_selected_skill = "curve"
+                        c2 = self._ai_pick_curve_cell2(aim)
+                        self.ai_curve_cell2 = c2
+                        tx, ty = CELL_CENTERS[aim]
+                        tx2, ty2 = CELL_CENTERS[c2]
+                        mix = random.uniform(0.3, 0.7)
+                        tx = tx * mix + tx2 * (1 - mix)
+                        ty = ty * mix + ty2 * (1 - mix)
+                        self.ai_curve_dir = 1.0 if (tx2 - CELL_CENTERS[aim][0]) > 0 else -1.0
+                        self.ai_target = (tx, ty, power)
+                        return
+                tx, ty = CELL_CENTERS[aim]
+                self.ai_target = (tx, ty, power)
+                return
+        except Exception as e:
+            _log_exc("AI-SHOT", e)
+        self._ai_decide_shot_legacy()
+
+    def _ai_decide_shot_legacy(self):
+        """v1.24 的原启发式(几何权重 + 均匀力度) —— 新 AI 的兜底。"""
         # 整场固定一名射手(在 reset_match 里已选定), 这里只取用, 不再换人
         ai_sp = self.ai_striker_profile
         if ai_sp is None:
@@ -2295,7 +3032,65 @@ class Game:
         return random.choice(candidates)
 
     def _ai_decide_dive(self):
-        """AI 决定扑救方向 - 学习玩家射门模式."""
+        """AI 决定扑救方向 - v1.25 期望决策 + 对手建模(异常退回 legacy)。"""
+        try:
+            ai_kp = self.ai_keeper_profile
+            if ai_kp is None:
+                ai_kp = random.choice(KEEPERS)
+                self.ai_keeper_profile = ai_kp
+            tbl = self._ai_tbl("a")
+            if tbl is not None:
+                cells = list(CELL_CENTERS.keys())
+                # 玩家射手的力度档表 + bucket->档位映射
+                # (B3=超大力技能 -> 有该技能档就用它, 否则按满力档估)
+                tiers = _ai_tiers_for(self.striker_profile)
+                ps_idx = None
+                for _i, (_pw, _sk) in enumerate(tiers):
+                    if _sk == "power_shot":
+                        ps_idx = _i
+
+                def bmap(b):
+                    if b == 3 and ps_idx is not None:
+                        return ps_idx
+                    return min(b, len(tiers) - 1)
+
+                model = self._ai_shot_model
+                model.cap = self._ai_exploit_cap()
+                td = model.tier_dist()
+                # 每格的期望失球 = SUM(力度档 x 瞄格分布 x 该扑格下被进球率)
+                ev = {j: 0.0 for j in cells}
+                for b in range(4):
+                    wb = td[b]
+                    if wb < 1e-4:
+                        continue
+                    ti = bmap(b)
+                    if ti >= len(tbl):
+                        continue
+                    ad = model.aim_given_tier(b)
+                    tt = tbl[ti]
+                    for i in cells:
+                        g = tt[i]
+                        for j in cells:
+                            ev[j] += wb * ad[i] * g[j]
+                # softmax 取失球期望最小; 落后时集中度加硬(必须扑出)
+                if random.random() < self._ai_eps():
+                    # v1.25: eps 分支用低β softmax 而非 9 格均匀(同射门侧)。
+                    cell = _ai_softmax_pick(cells, [-ev[j] for j in cells],
+                                            self._ai_beta(4.0))
+                else:
+                    # v1.25: β 5->22。失球期望格间差仅 0.01~0.09, β=6 时
+                    # softmax 近似均匀(实测扑格概率 0.09~0.15), 白丢 3+ 个点。
+                    # β=22(默认强度下有效~26) 集中到 top2~3 扑格, 保留随机性。
+                    beta = self._ai_beta(22.0) * (1.0 + 0.4 * self._ai_behind_urgency())
+                    cell = _ai_softmax_pick(cells, [-ev[j] for j in cells], beta)
+                self.ai_dive_target = CELL_CENTERS[cell]
+                return
+        except Exception as e:
+            _log_exc("AI-DIVE", e)
+        self._ai_decide_dive_legacy()
+
+    def _ai_decide_dive_legacy(self):
+        """v1.24 的原启发式(手拍权重 + 最近3列学习) —— 新 AI 的兜底。"""
         # 整场固定一名门将(在 reset_match 里已选定), 这里只取用, 不再换人
         ai_kp = self.ai_keeper_profile
         if ai_kp is None:
@@ -3224,6 +4019,10 @@ class Game:
                 prev = getattr(self, "_last_logged_state", None)
                 _log("STATE", "%s -> %s" % (prev, self.state))
                 self._last_logged_state = self.state
+                # v1.25: 任何路径进入 GAME_OVER 都补一条对局汇总(单点挂钩,
+                # 不用在 4 个跳转处各写一遍)
+                if self.state == State.GAME_OVER:
+                    self._matchlog_match()
         except Exception:
             pass
         # v1.24: 输入法兜底通道(真实 EditText)没有 SDL 的 TEXTINPUT 事件,
@@ -3786,6 +4585,132 @@ class Game:
             self._finish_shot(True)
             self.goal_effect_t = 1.5
 
+    def _matchlog_export(self):
+        """v1.25: 把对局日志复制到用户可取的位置, 返回 (路径, 习惯摘要)。
+        安卓: matches.jsonl 本就在外部文件目录(Android/data/.../files/),
+              文件管理器/USB 都能取, 直接报路径;
+        PC:   复制一份带时间戳的到游戏目录的上一级(桌面侧), 方便找到上传。"""
+        try:
+            import shutil
+            import time as _t
+            src = _matchlog_path()
+            if not os.path.exists(src) or os.path.getsize(src) < 10:
+                return None, "暂无对局日志(先完整打一局)"
+            if IS_ANDROID:
+                dst = src
+            else:
+                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                dst = os.path.join(root,
+                                   "对局日志-%s.jsonl" % _t.strftime("%Y%m%d-%H%M"))
+                try:
+                    shutil.copyfile(src, dst)
+                except Exception:
+                    dst = src
+            # 本地玩家习惯摘要(与 AI 暖启动同一数据源)
+            h = _matchlog_habit()
+            parts = []
+            if h.get("shots"):
+                parts.append("射门偏好: " + " ".join(
+                    "%d号%.0f%%" % (c, n / float(h["shots"]) * 100)
+                    for c, n in h["shot_top"]))
+            if h.get("dives"):
+                parts.append("扑救偏好: " + " ".join(
+                    "%d号%.0f%%" % (c, n / float(h["dives"]) * 100)
+                    for c, n in h["dive_top"]))
+            if h.get("shot_alt") is not None:
+                parts.append("换格率%.0f%%" % (h["shot_alt"] * 100))
+            if h.get("rounds"):
+                parts.append("近%d轮" % h["rounds"])
+            summary = " | ".join(parts) if parts else "数据不足"
+            return dst, summary
+        except Exception as e:
+            _log_exc("MLOG-E", e)
+            return None, "导出失败(详见日志)"
+
+    def _matchlog_match(self):
+        """v1.25: 一场结束写一条汇总记录(在进入 GAME_OVER 时调用一次)。"""
+        if not getattr(self, "_matchlog_on", False):
+            return
+        try:
+            import time as _t
+            p_sp = self.striker_profile
+            p_kp = self.keeper_profile
+            a_sp = self.ai_striker_profile
+            a_kp = self.ai_keeper_profile
+            rec = {
+                "t": "match", "ts": int(_t.time()), "v": VERSION,
+                "score": [self.player_score, self.ai_score],
+                "rounds": self.round_num,
+                "ot": 1 if self.is_overtime else 0,
+                "p_sp": ([p_sp.name, p_sp.power, p_sp.accuracy, p_sp.composure]
+                         if p_sp else None),
+                "p_kp": ([p_kp.name, p_kp.reflex, p_kp.reach, p_kp.dive]
+                         if p_kp else None),
+                "ai_sp": ([a_sp.name, a_sp.power, a_sp.accuracy, a_sp.composure]
+                          if a_sp else None),
+                "ai_kp": ([a_kp.name, a_kp.reflex, a_kp.reach, a_kp.dive]
+                          if a_kp else None),
+                "stats": {k: v for k, v in self.match_stats.items()
+                          if k != "key_events"},
+                "events": list(self.match_stats.get("key_events", []))[-20:],
+            }
+            _matchlog_append(rec)
+            self._matchlog_on = False      # 一场只记一次
+        except Exception as e:
+            _log_exc("MLOG-M", e)
+
+    def _matchlog_round(self, scored: bool):
+        """v1.25: 把本轮写成一条 JSON 记录(matches.jsonl), 同时喂对手模型。
+        只在真实对局里开(_matchlog_on, 由 reset_match 置 True) ——
+        离线探针/自动化测试直接驱动 _commit_player_shot 时不写,
+        否则一次百万发模拟会把日志刷爆。"""
+        if not getattr(self, "_matchlog_on", False):
+            return
+        import time as _t
+        if self.attacker_is_player:
+            aim = self.player_shot_history[-1] if self.player_shot_history else 0
+            pw = self.player_power_history[-1] if self.player_power_history else 0.5
+            _dt = self.ai_dive_target or (0.0, 1.22)
+            dive = _cell_of(_dt[0], _dt[1])
+        else:
+            _at = self.ai_target if self.ai_target else (0.0, 1.22, 0.5)
+            aim = _cell_of(_at[0], _at[1])
+            pw = _at[2]
+            dive = self.player_dive_history[-1] if self.player_dive_history else 0
+        try:
+            sp = (self.striker_profile if self.attacker_is_player
+                  else (self.ai_striker_profile or STRIKERS[0]))
+            kp = ((self.ai_keeper_profile or KEEPERS[0]) if self.attacker_is_player
+                  else self.keeper_profile)
+            rec = {
+                "t": "round", "ts": int(_t.time()), "v": VERSION,
+                "rnd": self.round_num, "ph": self.round_phase,
+                "atk": "P" if self.attacker_is_player else "A",
+                "sp": [sp.name, sp.power, sp.accuracy, sp.composure],
+                "kp": [kp.name, kp.reflex, kp.reach, kp.dive],
+                "aim": int(aim), "pw": round(float(pw), 3),
+                "skill": self._shot_skill, "dive": int(dive),
+                "out": self.last_outcome,
+                "why": (self.save_fail_reason or "")[:40],
+                "spd": round(float(self.last_ball_speed or 0), 1),
+                "fly": round(float(self.last_flight_time or 0), 3),
+                "sc": [self.player_score, self.ai_score],
+                "fat": [round(float(self.player_fatigue), 1),
+                        round(float(self.ai_fatigue), 1)],
+                "ot": 1 if self.is_overtime else 0,
+            }
+            _matchlog_append(rec)
+        except Exception as e:
+            _log_exc("MLOG", e)
+        # 同步喂对手模型(局内实时学习; 与日志同一数据口径)
+        try:
+            if self.attacker_is_player:
+                self._ai_shot_model.observe(int(aim), _ai_bucket(pw, self._shot_skill))
+            else:
+                self._ai_dive_model.observe(int(dive))
+        except Exception:
+            pass
+
     def _finish_shot(self, scored: bool):
         # 记录统计
         self.match_stats["total_shots"] += 1
@@ -3906,6 +4831,11 @@ class Game:
         self.results_log.append((self.round_num,
                                  "玩家" if self.attacker_is_player else "AI",
                                  self.last_outcome))
+        # v1.25: 对局日志(记录所有轮次, 供上传分析与 AI 跨场习惯学习)
+        try:
+            self._matchlog_round(scored)
+        except Exception:
+            pass
         self.state = State.ROUND_RESULT
         self.result_t = 0.0
 
@@ -4239,6 +5169,10 @@ class Game:
         re_ = self._dev_export_rect()
         he = self._point_in_rect(self.mouse_pos, re_)
         self._draw_button(screen, re_, "导出日志", hover=he, active=he)
+        # v1.25: 对局日志(matches.jsonl 导出 + 玩家习惯摘要)
+        rm = self._dev_matchlog_rect()
+        hm = self._point_in_rect(self.mouse_pos, rm)
+        self._draw_button(screen, rm, "对局日志", hover=hm, active=hm)
         r4 = self._dev_params_rect()
         h4 = self._point_in_rect(self.mouse_pos, r4)
         self._draw_button(screen, r4, "调参数", hover=h4, active=h4)
@@ -4246,22 +5180,26 @@ class Game:
         h3 = self._point_in_rect(self.mouse_pos, r3)
         self._draw_button(screen, r3, "返回菜单", hover=h3)
 
-    # v1.19: 5 个按钮, 统一 140 宽(每个占 ±70)。
-    # 中心点 -320 / -160 / 0 / +160 / +320, 间距 160 > 140, 互不重叠且都在面板(±450)内。
+    # v1.25: 6 个按钮, 统一 130 宽(每个占 ±65)。
+    # 中心点 -375/-225/-75/+75/+225/+375, 间距 150 > 130, 互不重叠且都在面板(±450)内。
     def _dev_clear_rect(self):
-        return self._button_rect(WIDTH // 2 - 320, HEIGHT - 60, 140, 46)
+        return self._button_rect(WIDTH // 2 - 375, HEIGHT - 60, 130, 46)
 
     def _dev_ptest_rect(self):
-        return self._button_rect(WIDTH // 2 - 160, HEIGHT - 60, 140, 46)
+        return self._button_rect(WIDTH // 2 - 225, HEIGHT - 60, 130, 46)
 
     def _dev_params_rect(self):
-        return self._button_rect(WIDTH // 2, HEIGHT - 60, 140, 46)
+        return self._button_rect(WIDTH // 2 - 75, HEIGHT - 60, 130, 46)
 
     def _dev_export_rect(self):
-        return self._button_rect(WIDTH // 2 + 160, HEIGHT - 60, 140, 46)
+        return self._button_rect(WIDTH // 2 + 75, HEIGHT - 60, 130, 46)
+
+    def _dev_matchlog_rect(self):
+        """v1.25: 对局日志(导出供上传 + 本地玩家习惯分析)。"""
+        return self._button_rect(WIDTH // 2 + 225, HEIGHT - 60, 130, 46)
 
     def _dev_back_rect(self):
-        return self._button_rect(WIDTH // 2 + 320, HEIGHT - 60, 140, 46)
+        return self._button_rect(WIDTH // 2 + 375, HEIGHT - 60, 130, 46)
 
     def _handle_dev(self, ev):
         if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE,
@@ -4281,6 +5219,14 @@ class Game:
             if self._point_in_rect(ev.pos, self._dev_export_rect()):
                 _p = _export_log()
                 self._dev_msg = ("已导出: %s" % _p) if _p else "导出失败(详见日志)"
+                return
+            # v1.25: 对局日志(matches.jsonl)导出 + 本地玩家习惯摘要
+            if self._point_in_rect(ev.pos, self._dev_matchlog_rect()):
+                _p, _sum = self._matchlog_export()
+                if _p:
+                    self._dev_msg = "%s | %s" % (os.path.basename(_p), _sum)
+                else:
+                    self._dev_msg = _sum
                 return
             # v1.19: 进入可调参数页
             if self._point_in_rect(ev.pos, self._dev_params_rect()):
@@ -4506,6 +5452,13 @@ class Game:
         self._draw_button(screen, rt,
                           "加入选卡: %s" % ("是" if on else "否"),
                           hover=ht, active=on)
+        # v1.25: AI 选用自制角色开关(强度正相关: 三维全满=80%, 三维和<=20=0%)
+        ap = self._ptest_ai_pick_enabled()
+        ra = self._ptest_aipick_rect()
+        ha = self._point_in_rect(self.mouse_pos, ra)
+        self._draw_button(screen, ra,
+                          "AI选用自制: %s" % ("是" if ap else "否"),
+                          hover=ha, active=ap)
         sub = self.font_s.render(
             "开关选「是」才出现第5/6张卡; 名字上限8字母(4汉字); 数值1~10",
             True, (215, 225, 235))
@@ -4630,6 +5583,11 @@ class Game:
 
     def _ptest_toggle_rect(self):
         return self._button_rect(WIDTH - 250, 24, 230, 44)
+
+    def _ptest_aipick_rect(self):
+        """v1.25: 「AI选用自制角色」开关(右上第二个, 紧贴「加入选卡」下方)。
+        与右侧门将面板顶部仅 6px 视觉交叠, 点击区域不与任何可点元素冲突。"""
+        return self._button_rect(WIDTH - 250, 72, 230, 40)
 
     def _ptest_sname_rect(self):
         return (WIDTH // 2 - 560 + 110, 108 + 84, 240, 52)
@@ -4864,6 +5822,8 @@ class Game:
                 "s_stats": dict(s),
                 "k_stats": dict(k),
                 "on": self._ptest_enabled(),
+                # v1.25: AI 是否选用玩家自制角色(强度正相关概率)
+                "ai_pick": self._ptest_ai_pick_enabled(),
             }
             with open(self._ptest_config_path(), "w", encoding="utf-8") as fh:
                 _json.dump(data, fh, ensure_ascii=False)
@@ -4897,6 +5857,8 @@ class Game:
                 "dive": max(1, min(10, int(ks.get("dive", 7)))),
             }
             self._tester_on = bool(data.get("on", False))
+            # v1.25: AI 选用自制角色开关(默认否 —— 不影响原玩家)
+            self._tester_ai_pick = bool(data.get("ai_pick", False))
             if self._tester_on:
                 self._ptest_generate()
         except Exception as e:
@@ -4970,6 +5932,24 @@ class Game:
                 self._tester_on = not self._ptest_enabled()
                 self._ptest_generate()
                 self._ptest_save_config()
+                return
+            # v1.25: AI 选用自制角色开关(即时持久化, 下场比赛选人时生效)
+            if self._point_in_rect(ev.pos, self._ptest_aipick_rect()):
+                self._tester_ai_pick = not self._ptest_ai_pick_enabled()
+                self._ptest_save_config()
+                s_sum = (int(self._ptest_striker_stats()["power"])
+                         + int(self._ptest_striker_stats()["accuracy"])
+                         + int(self._ptest_striker_stats()["composure"]))
+                k_sum = (int(self._ptest_keeper_stats()["reflex"])
+                         + int(self._ptest_keeper_stats()["reach"])
+                         + int(self._ptest_keeper_stats()["dive"]))
+                self._ptest_msg = ("AI选用自制: %s (射手三维和%d->%.0f%%, "
+                                   "门将三维和%d->%.0f%%)"
+                                   % ("是" if self._tester_ai_pick else "否",
+                                      s_sum, self._ai_pick_custom_prob(
+                                          self._tester_striker_obj) * 100,
+                                      k_sum, self._ai_pick_custom_prob(
+                                          self._tester_keeper_obj) * 100))
                 return
             if self._ptest_click_row(ev.pos):
                 return
