@@ -35,7 +35,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.25"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.26"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -380,7 +380,9 @@ POWER_FACTOR_MIN = 0.55
 # ±0.10+, 期望表 MAE 0.14~0.25 且格子间出现负相关; 分层后边界量化误差
 # 随 n 收敛: n=24 仍 ±0.05(同格/相邻概率跳变 0.48 的格子), n=48 压到
 # ±0.02(与 n=200 一致), PC 单表构建约 0.26s, 手机约 0.5~1s(按疲劳桶缓存)。
-AI_EV_SAMPLES = 48
+# v1.26 性能: 实测整局重建 8 次/共 2.3s(PC), 手机 5~9s 冻结 —— 故安卓端
+# 样本减半到 24(精度损失可忽略), 且构建改分帧摊销(见 _AITableBuilder)。
+AI_EV_SAMPLES = 24 if IS_ANDROID else 48
 AI_TIERS_NORMAL = (0.5, 0.8, 1.0)   # 普通射门的三档力度
 AI_TIER_POWER = 1.3           # 超大力技能档(不受疲劳力度上限压制)
 AI_TIER_PRECISION = 0.6       # 超精准技能档(力度上限60%)
@@ -643,6 +645,84 @@ def _ai_goal_table(sp, kp, fatigue, is_overtime, tiers, who,
     return out
 
 
+class _AITableBuilder:
+    """期望表的分帧增量构建器(v1.26 性能修复)。
+
+    实测整局比赛要重建期望表 8 次、PC 共 2.3s, 手机上 5~9s 的硬冻结 ——
+    本类把同样的计算(采样/物理/判定链与 _ai_goal_table 完全一致, 产物相同)
+    切成 draw 粒度的时间片, 由 Game.update 每帧喂几 ms 预算, 冻结消失。
+    完成前决策层用旧表顶替(stale-while-revalidate)或退回 legacy。
+    """
+
+    def __init__(self, sp, kp, fatigue, is_overtime, tiers, who,
+                 samples=AI_EV_SAMPLES, seed=20260930):
+        self.sp, self.kp, self.who = sp, kp, who
+        self.fatigue, self.is_overtime = fatigue, is_overtime
+        self.tiers, self.samples = tiers, samples
+        self.rng = random.Random(seed + int(fatigue * 10) + sp.power * 131
+                                 + kp.reflex * 17)
+        self.out = []
+        self.key = None          # 由 _ai_tbl 填入(缓存键)
+        self.ti = 0              # 当前力度档
+        self.sxsy = None         # 当前档的 (sx, sy, spd_base)
+        self.draws = None
+        self.tier_tab = None
+        self.aims = []           # 当前档剩余瞄格
+        self.acc = None          # 当前瞄格的累计进球
+        self.di = 0              # 当前瞄格已处理的 draw 下标
+        self.done = False
+
+    def step(self, budget_ms=4.0):
+        """在时间预算内推进构建; 返回 True 表示全部完成。"""
+        if self.done:
+            return True
+        t_end = time.perf_counter() + budget_ms / 1000.0
+        n = float(self.samples)
+        while True:
+            if self.ti >= len(self.tiers):
+                self.done = True
+                return True
+            if self.tier_tab is None:                    # 开新档
+                power, skill = self.tiers[self.ti]
+                self.sxsy = _ai_noise_model(self.sp, power, self.fatigue,
+                                            skill, self.is_overtime, self.who)
+                self.draws = _ai_strat_draws(self.rng, self.samples)
+                self.tier_tab = {}
+                self.aims = list(CELL_CENTERS.keys())
+                self.acc = None
+            if self.acc is None:                         # 开新瞄格
+                if not self.aims:                        # 本档完成
+                    self.out.append(self.tier_tab)
+                    self.ti += 1
+                    self.tier_tab = None
+                    continue
+                self.cur_aim = self.aims.pop(0)
+                self.acc = {j: 0.0 for j in CELL_CENTERS}
+                self.di = 0
+            # 处理当前瞄格的 draw(每 draw 约 0.2~0.5ms PC / 1~2ms 手机)
+            sx, sy, spd_base = self.sxsy
+            tx0, ty0 = CELL_CENTERS[self.cur_aim]
+            while self.di < len(self.draws):
+                zx, zy, sm, spin = self.draws[self.di]
+                self.di += 1
+                bx = tx0 + zx * sx
+                by = max(0.05, ty0 + zy * sy)
+                if (-GOAL_W / 2 <= bx <= GOAL_W / 2 and 0 <= by <= GOAL_H):
+                    speed = max(6.0, spd_base * sm)
+                    _vx, _vy, _vz, t_fly, v_arr = solve_launch(
+                        0.0, BALL_RADIUS, PENALTY_Z, bx, by, speed, spin)
+                    for j in CELL_CENTERS:
+                        p = _ai_save_prob(bx, by, v_arr, t_fly, j,
+                                          self.sp.power, self.sp.accuracy,
+                                          self.kp, self.fatigue,
+                                          self.tiers[self.ti][1])
+                        self.acc[j] += 1.0 - p
+                if time.perf_counter() >= t_end:
+                    return False
+            self.tier_tab[self.cur_aim] = {j: v / n for j, v in self.acc.items()}
+            self.acc = None
+
+
 def _ai_softmax_pick(items, scores, beta, rng=None):
     """按 softmax(beta*score) 采样一个 item(保留不可预测性, 不取 argmax)。"""
     mx = max(scores)
@@ -773,12 +853,15 @@ _MATCHLOG_MAX_BYTES = 2 * 1024 * 1024     # 超过 2MB 保留最近 5000 行
 
 
 def _matchlog_append(rec):
-    """追加一条记录; 体积超限先滚动截断。任何异常都不影响游戏。"""
+    """追加一条记录; 体积超限先滚动截断。任何异常都不影响游戏。
+    v1.26: 截断(全文重读+重写)只在 match 汇总记录时做 —— 比赛进行中
+    只允许纯追加, 避免中局出现上百 ms 的闪存顿挫。"""
     try:
         import json as _json
         p = _matchlog_path()
         try:
-            if os.path.exists(p) and os.path.getsize(p) > _MATCHLOG_MAX_BYTES:
+            if (rec.get("t") == "match" and os.path.exists(p)
+                    and os.path.getsize(p) > _MATCHLOG_MAX_BYTES):
                 with open(p, "r", encoding="utf-8") as fh:
                     lines = fh.readlines()
                 with open(p, "w", encoding="utf-8") as fh:
@@ -792,18 +875,30 @@ def _matchlog_append(rec):
 
 
 def _matchlog_recent_rounds(n=AI_WARM_ROUNDS):
-    """读最近 n 条 round 记录(oldest->newest), 供暖启动与习惯分析。"""
+    """读最近 n 条 round 记录(oldest->newest), 供暖启动与习惯分析。
+    v1.26: 只读文件尾部(二进制 seek), 不再 readlines 全文 —— 手机开局
+    暖启动从 0.5~2s 降到几 ms。"""
     try:
         import json as _json
         p = _matchlog_path()
         if not os.path.exists(p):
             return []
-        with open(p, "r", encoding="utf-8") as fh:
-            lines = fh.readlines()
+        size = os.path.getsize(p)
+        off = max(0, size - 256 * 1024)
+        with open(p, "rb") as fh:
+            fh.seek(off)
+            blob = fh.read()
+        # 仅从中间截断读入时, 头部才是半行需要丢弃; off=0 时首行完整必须保留
+        if off > 0:
+            nl = blob.find(b"\n")
+            blob = blob[nl + 1:] if nl >= 0 else b""
+        lines = blob.split(b"\n")
         out = []
         for ln in lines[-(n * 2):]:          # round/match 混存, 多读一倍再过滤
             try:
-                r = _json.loads(ln)
+                if not ln.strip():
+                    continue
+                r = _json.loads(ln.decode("utf-8"))
                 if r.get("t") == "round":
                     out.append(r)
             except Exception:
@@ -2639,6 +2734,8 @@ class Game:
         self._ai_tbl_b = None      # [AI射手 x 玩家门将] 供 AI 射门决策
         self._ai_tbl_a_key = None
         self._ai_tbl_b_key = None
+        self._ai_bld_a = None      # v1.26: 分帧增量构建器(完成前用旧表/legacy)
+        self._ai_bld_b = None
         self.power_shot_active = False
         self.selected_skill = "normal"
         self.ai_selected_skill = "normal"
@@ -2814,7 +2911,9 @@ class Game:
 
     def _ai_tbl(self, which):
         """期望表懒构建 + 缓存(which="a" 玩家射手xAI门将 / "b" AI射手x玩家门将)。
-        缓存键含疲劳档: 疲劳变化超过 AI_EV_FAT_BUCKET 才重建(控制手机端卡顿)。"""
+        缓存键含疲劳档: 疲劳变化超过 AI_EV_FAT_BUCKET 才重建(控制手机端卡顿)。
+        v1.26: 重建不再同步进行 —— 只登记一个 _AITableBuilder, 由 update 泵
+        分帧完成; 完成前用旧表顶替(stale-while-revalidate), 没旧表退回 legacy。"""
         try:
             if which == "a":
                 sp = self.striker_profile
@@ -2832,16 +2931,47 @@ class Game:
             kattr = "_ai_tbl_%s_key" % which
             if getattr(self, kattr, None) == key:
                 return getattr(self, "_ai_tbl_" + which)
-            tbl = _ai_goal_table(sp, kp, fat, self.is_overtime,
-                                 _ai_tiers_for(sp), who)
-            setattr(self, "_ai_tbl_" + which, tbl)
-            setattr(self, kattr, key)
-            return tbl
+            battr = "_ai_bld_" + which
+            b = getattr(self, battr, None)
+            if b is None or b.key != key:
+                b = _AITableBuilder(sp, kp, fat, self.is_overtime,
+                                    _ai_tiers_for(sp), who)
+                b.key = key
+                setattr(self, battr, b)
+            return getattr(self, "_ai_tbl_" + which, None)   # 旧表(可能为None)
         except Exception as e:
             _log_exc("AI-TBL", e)
             setattr(self, "_ai_tbl_" + which, None)
             setattr(self, "_ai_tbl_%s_key" % which, None)
             return None
+
+    def _ai_build_pump(self, budget_ms=3.0):
+        """每帧从 update 调用: 分帧推进挂起的期望表构建(射门动画期跳过)。"""
+        if self.state == State.BALL_FLY:
+            return
+        for which in ("a", "b"):
+            b = getattr(self, "_ai_bld_" + which, None)
+            if b is None:
+                continue
+            try:
+                if b.step(budget_ms):
+                    setattr(self, "_ai_tbl_" + which, b.out)
+                    setattr(self, "_ai_tbl_%s_key" % which, b.key)
+                    setattr(self, "_ai_bld_" + which, None)
+            except Exception as e:
+                _log_exc("AI-BLD", e)
+                setattr(self, "_ai_bld_" + which, None)
+
+    def _ai_finish_builds(self):
+        """离线探针用: 同步完成所有挂起的建表(模拟手机上 update 泵已完成)。"""
+        for which in ("a", "b"):
+            b = getattr(self, "_ai_bld_" + which, None)
+            if b is None:
+                continue
+            b.step(10 ** 9)
+            setattr(self, "_ai_tbl_" + which, b.out)
+            setattr(self, "_ai_tbl_%s_key" % which, b.key)
+            setattr(self, "_ai_bld_" + which, None)
 
     def _ai_decide_shot(self):
         """AI 决定射门目标 + 力度 - v1.25 期望决策(异常退回 legacy)。"""
@@ -4012,6 +4142,7 @@ class Game:
     # ----------------------------------------------------------------
     def update(self, dt: float):
         self.state_t += dt
+        self._ai_build_pump()      # v1.26: 期望表分帧构建(射门动画期自动跳过)
         # v1.19: 记录状态机切换轨迹。真机"卡在某个页面不动/跳屏"时,
         # 日志里能直接看出是从哪一步跳到哪一步、在哪一步停留了多久。
         try:
