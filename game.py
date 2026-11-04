@@ -35,7 +35,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.26"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.27"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -1631,9 +1631,10 @@ def _vib_create_notification_channel():
                 3  # IMPORTANCE_DEFAULT
             )
             channel.enableVibration(True)
-            # 来电式波形: 0ms延迟, 震100, 歇50, 震100
-            # 直接传 Python list 让 jnius 转 long[](用 array.array('j') 会报 bad typecode)
-            channel.setVibrationPattern([0, 100, 50, 100])
+            # v1.27: 删掉 setVibrationPattern —— pyjnius 转 long[] 时内部调
+            # array.array('j',...) 而 Python array 没有 'j' 类型码, 必抛
+            # "bad typecode"(9月真机日志每次都在报)。enableVibration(True)
+            # 用系统默认波形即可, 通知路径本来也只是最后兜底。
             nm.createNotificationChannel(channel)
             _vib_channel_created = True
             _VIB["notif"] = "通道已建"
@@ -1909,20 +1910,28 @@ def _vib_via_service(ms):
             try:
                 Bld = autoclass('android.media.AudioAttributes$Builder')
                 b = Bld()
-                b.setUsage(5)   # USAGE_NOTIFICATION = 5
+                # v1.27: USAGE_NOTIFICATION(5) -> USAGE_GAME(14)。
+                # 通知类震动会被系统按"通知渠道"调度(受勿扰/渠道设置影响),
+                # 实测真机震动有明显延迟; 游戏即时反馈应该用 GAME 语义。
+                b.setUsage(14)  # USAGE_GAME = 14
                 attrs = b.build()
             except Exception as e:
                 tried.append("attrs:%s" % e)
 
             if VibrationEffect is not None:
-                if attrs is not None:
-                    eff = None
-                    try:
-                        eff = VibrationEffect.createOneShot(int(ms), 255)
-                    except Exception as e:
-                        tried.append("mk1s:%s" % e)
-                    if eff is not None:
-                        if try_call("vib(1s+@notif)",
+                # v1.27: 首选【不带 attrs 的直接震动】—— 不挂 AudioAttributes 的
+                # vibrate() 走应用直驱路径, 无通知调度延迟; 只有直连失败才用 attrs。
+                eff = None
+                try:
+                    eff = VibrationEffect.createOneShot(int(ms), 255)
+                except Exception as e:
+                    tried.append("mk1s:%s" % e)
+                if eff is not None:
+                    if try_call("vib(1s直连)", lambda: vib.vibrate(eff)):
+                        _VIB["tries"] = "|".join(tried)
+                        return
+                    if attrs is not None:
+                        if try_call("vib(1s+@game)",
                                     lambda: vib.vibrate(eff, attrs)):
                             _VIB["tries"] = "|".join(tried)
                             return
@@ -1932,16 +1941,16 @@ def _vib_via_service(ms):
                 except Exception as e:
                     tried.append("mkwave:%s" % e)
                 if eff is not None:
-                    if try_call("vib(wave+amp)", lambda: vib.vibrate(eff)):
+                    if try_call("vib(wave直连)", lambda: vib.vibrate(eff)):
                         _VIB["tries"] = "|".join(tried)
                         return
-                    if attrs is not None and try_call("vib(wave+@notif)",
+                    if attrs is not None and try_call("vib(wave+@game)",
                                                        lambda: vib.vibrate(eff, attrs)):
                         _VIB["tries"] = "|".join(tried)
                         return
 
             if attrs is not None:
-                if try_call("vibrate(ms+attr)", lambda: vib.vibrate(int(ms), attrs)):
+                if try_call("vibrate(ms+@game)", lambda: vib.vibrate(int(ms), attrs)):
                     _VIB["tries"] = "|".join(tried)
                     return
 
@@ -2118,7 +2127,7 @@ class StrikerProfile:
 
 STRIKERS: List[StrikerProfile] = [
     StrikerProfile(
-        "power", "詹姆斯",
+        "power", "姆",
         power=9, accuracy=3, composure=7,
         color=(220, 60, 60), skin=(232, 196, 158),
         desc="重炮手:球速可达28m/s几乎无法扑救,但落点飘忽,大力射门常打飞",
@@ -2126,7 +2135,7 @@ STRIKERS: List[StrikerProfile] = [
         skill_desc="消耗大量体力(+8疲劳)换取极大射门力度,高风险高回报",
     ),
     StrikerProfile(
-        "tech", "杰瑞",
+        "tech", "瑞",
         power=7, accuracy=9, composure=10,
         color=(60, 130, 220), skin=(238, 206, 168),
         desc="手术刀:球速最慢却指哪打哪,零偏差专打死角,靠落点而非力量取胜",
@@ -2134,7 +2143,7 @@ STRIKERS: List[StrikerProfile] = [
         skill_desc="限用1次,精度暴增(偏差降至15%),但力度上限60%",
     ),
     StrikerProfile(
-        "curve", "兔同龙",
+        "curve", "兔",
         power=7, accuracy=7, composure=6,
         color=(180, 100, 220), skin=(228, 192, 154),
         desc="香蕉球:球带强侧旋在空中真实弯曲,可选2个相邻格,克制反应型门将",
@@ -2142,7 +2151,7 @@ STRIKERS: List[StrikerProfile] = [
         skill_desc="无限使用,每次射门选2个相邻格子,球弧线飞行,被臂展型门将克制",
     ),
     StrikerProfile(
-        "all", "牢二",
+        "all", "牢",
         power=8, accuracy=8, composure=8,
         color=(70, 170, 90), skin=(224, 188, 150),
         desc="六边形:球速/落点/心理全部中上,没有短板也没有绝活",
@@ -2167,7 +2176,7 @@ class KeeperProfile:
 
 KEEPERS: List[KeeperProfile] = [
     KeeperProfile(
-        "reflex", "莱特宁",
+        "reflex", "豹",
         reflex=10, reach=5, dive=8,
         color=(255, 200, 60), skin=(230, 196, 160),
         desc="闪电:反应全球最快(0.20s起跳),专吃四角重力球;但臂展仅5,差一格基本够不到",
@@ -2175,7 +2184,7 @@ KEEPERS: List[KeeperProfile] = [
         skill_desc="无特殊技能,反应极致(10),但臂展只有5(相邻格很难捞到)",
     ),
     KeeperProfile(
-        "wall", "魏豹",
+        "wall", "魏",
         reflex=5, reach=10, dive=7,
         color=(90, 90, 110), skin=(210, 178, 140),
         desc="铁壁:臂展10的巨灵神,选差一格也能靠臂展捞到;但反应5,快球常常还没动就进了",
@@ -2183,7 +2192,7 @@ KEEPERS: List[KeeperProfile] = [
         skill_desc="无特殊技能,臂展极致(10),但反应只有5(起跳慢半拍)",
     ),
     KeeperProfile(
-        "agile", "牢饭",
+        "agile", "饭",
         reflex=7, reach=6, dive=10,
         color=(120, 200, 220), skin=(236, 200, 162),
         desc="灵猫:鱼跃速度全球第一(0.30s横移到位),专吃非四角近角重力球;臂展偏小",
@@ -2191,7 +2200,7 @@ KEEPERS: List[KeeperProfile] = [
         skill_desc="无特殊技能,扑救极致(10),但臂展只有6",
     ),
     KeeperProfile(
-        "vet", "领导",
+        "vet", "导",
         reflex=7, reach=7, dive=7,
         color=(160, 90, 200), skin=(224, 190, 152),
         desc="老帅:三围平庸,但能预判对方射门力度等级,信息就是优势",
@@ -2199,7 +2208,7 @@ KEEPERS: List[KeeperProfile] = [
         skill_desc="被动技能:可模糊获知对方射门力度等级(弱/中/强)",
     ),
     KeeperProfile(
-        "all", "户晨凤",
+        "all", "户",
         reflex=8, reach=8, dive=8,
         color=(80, 160, 200), skin=(230, 194, 156),
         desc="门神:反应/臂展/扑救全部8分,没有任何明显弱点",
