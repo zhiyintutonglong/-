@@ -23,6 +23,16 @@ jobs:
         with:
           python-version: '3.10'
 
+      # v1.27: GitHub 运行器镜像升级后默认 JDK 变成 Java 25, 旧版 Gradle
+      # 解析不了 major version 69 的 class 文件(报 "Unsupported class file
+      # major version 69" 直接 BUILD FAILED), 与游戏代码无关。用 setup-java
+      # 显式钉到 17 并覆盖 JAVA_HOME/PATH。
+      - name: 固定 JDK 17(防止 runner 默认 JDK 25)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: 安装系统依赖
         run: |
           sudo apt-get update
@@ -30,7 +40,8 @@ jobs:
             git zip unzip openjdk-17-jdk autoconf automake libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev \
             libssl-dev libltdl-dev
-          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
+          java -version
 
       # 缓存 SDK/NDK(只复用 SDK/NDK 的下载, dist 每次强制重建)
       # key: buildozer-py310-v1 —— 与 buildozer.spec 里 python3==3.10.13 对应。
