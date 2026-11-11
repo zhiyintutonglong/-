@@ -35,7 +35,7 @@ import pygame
 # ====================================================================
 WIDTH, HEIGHT = 1280, 800
 FPS = 60
-VERSION = "1.27"          # 游戏版本号(标题栏 / 主菜单右下角显示)
+VERSION = "1.28"          # 游戏版本号(标题栏 / 主菜单右下角显示)
 APP_NAME = "点球乱射"
 SEED = None   # 填整数=每局随机序列完全可复现; None=每局真随机(默认)
 
@@ -1894,6 +1894,8 @@ def _vib_via_service(ms):
                 _VIB["ok"] = _VIB.get("ok", 0) + 1
                 _VIB["method"] = how
                 _VIB["err"] = "-"
+                # v1.28: 把实际命中的震动通道写进 app_debug.log, 便于真机对账
+                _vib_log("震动命中: %s ms=%s" % (how, ms))
                 tried.append(how)
 
             def try_call(how, fn):
@@ -1910,28 +1912,25 @@ def _vib_via_service(ms):
             try:
                 Bld = autoclass('android.media.AudioAttributes$Builder')
                 b = Bld()
-                # v1.27: USAGE_NOTIFICATION(5) -> USAGE_GAME(14)。
-                # 通知类震动会被系统按"通知渠道"调度(受勿扰/渠道设置影响),
-                # 实测真机震动有明显延迟; 游戏即时反馈应该用 GAME 语义。
-                b.setUsage(14)  # USAGE_GAME = 14
+                # v1.28: 回退到 USAGE_NOTIFICATION(5)。v1.27 改成"无 attrs 直驱
+                # 优先 + USAGE_GAME"后真机震动全没 —— 该 ROM 上 vibrate(eff)
+                # 不带 attrs 是【静默无效】(不抛异常也不震), try_call 误判成功
+                # 直接 return, 永远走不到真正能震的带 attrs 路径。既然 attrs 是
+                # 本机震动的必要条件, 恢复 v1.26 已验证可用的顺序。
+                b.setUsage(5)   # USAGE_NOTIFICATION = 5
                 attrs = b.build()
             except Exception as e:
                 tried.append("attrs:%s" % e)
 
             if VibrationEffect is not None:
-                # v1.27: 首选【不带 attrs 的直接震动】—— 不挂 AudioAttributes 的
-                # vibrate() 走应用直驱路径, 无通知调度延迟; 只有直连失败才用 attrs。
-                eff = None
-                try:
-                    eff = VibrationEffect.createOneShot(int(ms), 255)
-                except Exception as e:
-                    tried.append("mk1s:%s" % e)
-                if eff is not None:
-                    if try_call("vib(1s直连)", lambda: vib.vibrate(eff)):
-                        _VIB["tries"] = "|".join(tried)
-                        return
-                    if attrs is not None:
-                        if try_call("vib(1s+@game)",
+                if attrs is not None:
+                    eff = None
+                    try:
+                        eff = VibrationEffect.createOneShot(int(ms), 255)
+                    except Exception as e:
+                        tried.append("mk1s:%s" % e)
+                    if eff is not None:
+                        if try_call("vib(1s+@notif)",
                                     lambda: vib.vibrate(eff, attrs)):
                             _VIB["tries"] = "|".join(tried)
                             return
@@ -1941,16 +1940,16 @@ def _vib_via_service(ms):
                 except Exception as e:
                     tried.append("mkwave:%s" % e)
                 if eff is not None:
-                    if try_call("vib(wave直连)", lambda: vib.vibrate(eff)):
+                    if try_call("vib(wave+amp)", lambda: vib.vibrate(eff)):
                         _VIB["tries"] = "|".join(tried)
                         return
-                    if attrs is not None and try_call("vib(wave+@game)",
+                    if attrs is not None and try_call("vib(wave+@notif)",
                                                        lambda: vib.vibrate(eff, attrs)):
                         _VIB["tries"] = "|".join(tried)
                         return
 
             if attrs is not None:
-                if try_call("vibrate(ms+@game)", lambda: vib.vibrate(int(ms), attrs)):
+                if try_call("vibrate(ms+attr)", lambda: vib.vibrate(int(ms), attrs)):
                     _VIB["tries"] = "|".join(tried)
                     return
 
@@ -2554,11 +2553,12 @@ class Game:
         self._overlay: Optional[pygame.Surface] = None       # 复用的全屏遮罩
         self._num_cache = {}                                 # 队号数字(按字号缓存)
         # 云的初始布局与漂移速度(px/s); 每帧由 _draw_clouds_animated 让它们浮动
+        # v1.28: 整体下移 36px(原来 40~80 的云顶被记分牌/上沿遮住了一些)
         self._clouds = [
-            (100, 60, 70, 22, 6.0), (280, 40, 90, 26, 4.5),
-            (480, 75, 60, 20, 7.5), (680, 50, 80, 24, 5.0),
-            (900, 65, 65, 21, 6.5), (1080, 45, 75, 23, 4.0),
-            (1200, 80, 55, 18, 8.0),
+            (100, 96, 70, 22, 6.0), (280, 76, 90, 26, 4.5),
+            (480, 111, 60, 20, 7.5), (680, 86, 80, 24, 5.0),
+            (900, 101, 65, 21, 6.5), (1080, 81, 75, 23, 4.0),
+            (1200, 116, 55, 18, 8.0),
         ]
         self._effect_font_cache = {}                         # GOAL/SAVE 大字(按字号缓存)
         self._card_cache = {}                                # 球员卡片(按 索引+选中态 缓存)
